@@ -208,4 +208,158 @@ class SolicitudNotificacionHelper
             return [];
         }
     }
+
+    /** Traslado aprobado o rechazado por el Administrador de Bodegas: avisa al encargado de la bodega ORIGEN */
+    public function notificarTrasladoGestionado(int $idTraslado, bool $aprobado, ?string $comentario = null): void
+    {
+        $t = $this->_traslado($idTraslado);
+        if (!$t) return;
+
+        $accion = $aprobado ? 'aprobado' : 'rechazado';
+        $texto  = "El traslado #{$idTraslado} ({$t['bodega_origen']} -> {$t['bodega_destino']}) fue {$accion}";
+        if (!$aprobado && $comentario) {
+            $texto .= ': ' . $comentario;
+        }
+
+        $this->notificacion->enviarVarios($this->_encargadosDeBodega((int)$t['id_bodega_origen']), $texto);
+    }
+
+    /** Traslado aprobado: avisa al encargado de la bodega DESTINO que ya puede confirmar recepción */
+    public function notificarTrasladoListoRecepcion(int $idTraslado): void
+    {
+        $t = $this->_traslado($idTraslado);
+        if (!$t) return;
+
+        $this->notificacion->enviarVarios(
+            $this->_encargadosDeBodega((int)$t['id_bodega_destino']),
+            "El traslado #{$idTraslado} de {$t['bodega_origen']} está aprobado y listo para que confirmes la recepción en {$t['bodega_destino']}"
+        );
+    }
+
+    /** Solicitud de compra aprobada o rechazada: avisa a quien la solicitó */
+    public function notificarCompraGestionada(int $idCompra, bool $aprobado, ?string $comentario = null): void
+    {
+        $c = $this->_compra($idCompra);
+        if (!$c) return;
+
+        $accion = $aprobado ? 'aprobada' : 'rechazada';
+        $texto  = "Tu solicitud de compra #{$idCompra} de {$c['bodega']} fue {$accion}";
+        if (!$aprobado && $comentario) {
+            $texto .= ': ' . $comentario;
+        }
+
+        $this->notificacion->enviar($c['id_usuario_solicitante'], $texto);
+    }
+
+    /** Recepción parcial de un alta: avisa a los Administradores de Bodegas */
+    public function notificarRecepcionParcial(int $idAlta, float $cantidadRecibida, float $cantidadEsperada): void
+    {
+        $stmt = $this->connect->prepare(
+            "SELECT a.id, b.nombre AS bodega
+         FROM   bodega_inventario.altas a
+         INNER JOIN bodega_inventario.bodegas b ON b.id = a.id_bodega
+         WHERE  a.id = ? LIMIT 1"
+        );
+        $stmt->execute([$idAlta]);
+        $a = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$a) return;
+
+        $this->notificacion->enviarVarios(
+            $this->_administradoresBodegas(),
+            "Recepción parcial en el alta #{$idAlta} de {$a['bodega']}: {$cantidadRecibida} de {$cantidadEsperada} esperadas"
+        );
+    }
+
+    /** Aviso al intentar cerrar el mes habiendo solicitudes pendientes: avisa a Administradores y Contabilidad */
+    public function notificarCierreConPendientes(int $totalPendientes): void
+    {
+        $this->notificacion->enviarVarios(
+            $this->_administradoresBodegas(),
+            "El cierre mensual no se pudo ejecutar: hay {$totalPendientes} solicitud(es) Reservada(s) sin atender"
+        );
+    }
+
+// ---- privados nuevos ----
+
+    private function _traslado(int $idTraslado): ?array
+    {
+        try {
+            $stmt = $this->connect->prepare(
+                "SELECT t.id, t.id_bodega_origen, t.id_bodega_destino,
+                    bo.nombre AS bodega_origen, bd.nombre AS bodega_destino
+             FROM   bodega_inventario.traslados t
+             INNER JOIN bodega_inventario.bodegas bo ON bo.id = t.id_bodega_origen
+             INNER JOIN bodega_inventario.bodegas bd ON bd.id = t.id_bodega_destino
+             WHERE  t.id = ? LIMIT 1"
+            );
+            $stmt->execute([$idTraslado]);
+            return $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+        } catch (Exception $e) {
+            error_log("[SolicitudNotificacionHelper] _traslado({$idTraslado}): " . $e->getMessage());
+            return null;
+        }
+    }
+
+    private function _compra(int $idCompra): ?array
+    {
+        try {
+            $stmt = $this->connect->prepare(
+                "SELECT c.id, c.id_usuario_solicitante, b.nombre AS bodega
+             FROM   bodega_inventario.compras c
+             INNER JOIN bodega_inventario.bodegas b ON b.id = c.id_bodega
+             WHERE  c.id = ? LIMIT 1"
+            );
+            $stmt->execute([$idCompra]);
+            return $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+        } catch (Exception $e) {
+            error_log("[SolicitudNotificacionHelper] _compra({$idCompra}): " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /** Usuarios activos con puesto de Administrador de Bodegas (dbintranet.usuarios) */
+    private function _administradoresBodegas(): array
+    {
+        try {
+            $stmt = $this->connect->prepare(
+                "SELECT idUsuarios FROM dbintranet.usuarios
+             WHERE idPuesto = ? AND activo = 1"
+            );
+            $stmt->execute([\App\inventarioApi\Helpers\RolCompraHelper::PUESTO_ADMINISTRADOR_BODEGAS]);
+            return $stmt->fetchAll(PDO::FETCH_COLUMN) ?: [];
+        } catch (Exception $e) {
+            error_log("[SolicitudNotificacionHelper] _administradoresBodegas(): " . $e->getMessage());
+            return [];
+        }
+    }
+
+    /** Alerta de vencimiento notificada manualmente por el Administrador: avisa al encargado de la bodega */
+    public function notificarAlertaVencimiento(int $idLote, ?string $comentario = null): void
+    {
+        $stmt = $this->connect->prepare(
+            "SELECT le.id_bodega, b.nombre AS bodega, p.nombre AS producto,
+                le.fecha_expiracion, le.cantidad_disponible,
+                DATEDIFF(le.fecha_expiracion, CURDATE()) AS dias_restantes
+         FROM bodega_inventario.lotes_expiracion le
+         INNER JOIN bodega_inventario.bodegas b ON b.id = le.id_bodega
+         INNER JOIN bodega_inventario.productos p ON p.id = le.id_producto
+         WHERE le.id = ? LIMIT 1"
+        );
+        $stmt->execute([$idLote]);
+        $l = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$l) return;
+
+        $diasRestantes = (int)$l['dias_restantes'];
+        $fraseVencimiento = $diasRestantes < 0
+            ? "venció hace " . abs($diasRestantes) . " día(s)"
+            : "vence en {$diasRestantes} día(s)";
+
+        $texto = "Alerta de vencimiento: {$l['producto']} en {$l['bodega']} {$fraseVencimiento} "
+            . "({$l['cantidad_disponible']} unidades disponibles)";
+        if ($comentario) {
+            $texto .= ' — ' . $comentario;
+        }
+
+        $this->notificacion->enviarVarios($this->_encargadosDeBodega((int)$l['id_bodega']), $texto);
+    }
 }

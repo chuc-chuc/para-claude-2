@@ -173,6 +173,26 @@ final class inventarioApiClass extends ConexionBD
         'exportarStockCsv',
         'buscarFacturaSat', 'listarMisSolicitudesFactura', 'listarBandejaFacturas',
         'obtenerSolicitudFactura', 'obtenerHistorialFactura',
+        'obtenerBloqueosModulos',
+        'obtenerComprasEnTransito',
+        'obtenerAlertasVencimiento',
+        'listarConfigAlertasVencimiento',
+        'obtenerExistenciasCorrelativos',
+        'obtenerConsumosCorrelativos',
+        'obtenerTrazabilidadCorrelativo',
+        'obtenerExistenciasCorrelativosGlobal',
+        'obtenerConsumosCorrelativosGlobal',
+        'obtenerTrazabilidadCorrelativoGlobal',
+        'obtenerAlertasVencimientoGlobal',
+        'obtenerReporteExistenciasValorizadas',
+        'obtenerReporteAltasPeriodo',
+        'obtenerReporteConsumosPeriodo',
+        'obtenerReporteTrasladosPeriodo',
+        'listarCierresDisponibles',
+        'obtenerExistenciasValorizadasActuales',
+        'obtenerExistenciasValorizadasActualesDetalle',
+        'obtenerReporteExistenciasValorizadasDetalle',
+
     ];
 
     /** @var array<string> Métodos expuestos como POST. */
@@ -225,6 +245,10 @@ final class inventarioApiClass extends ConexionBD
         'registrarFacturaBodega', 'crearSolicitudFactura', 'solicitarCorreccionFactura',
         'reenviarSolicitudFactura', 'verificarFacturaBodega', 'subirComprobanteFactura',
         'descargarArchivoFacturaDrive',
+        'toggleBloqueoModulo',
+        'guardarConfigAlertaVencimiento',
+        'toggleConfigAlertaVencimiento',
+        'notificarAlertaVencimiento',
     ];
 
     // =========================================================================
@@ -2954,7 +2978,8 @@ final class inventarioApiClass extends ConexionBD
             $sql = "SELECT 
                 u.idUsuarios AS id, 
                 u.usuario, 
-                dp.nombres
+                dp.nombres,
+                dp.correoElectronico
             FROM dbintranet.usuarios u
             INNER JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = u.idDatosPersonales
             WHERE u.idEstados = 1 
@@ -4604,6 +4629,7 @@ final class inventarioApiClass extends ConexionBD
             $this->connect->prepare($sqlUpdateSolicitud)->execute([$idSolicitud]);
 
             $this->connect->commit();
+            $this->solicitudNotificacionHelper->notificarRechazada($idSolicitud, $motivo);
 
             return $this->res->ok('La solicitud ha sido rechazada y las reservas de inventario se liberaron correctamente');
 
@@ -5316,6 +5342,11 @@ final class inventarioApiClass extends ConexionBD
     {
         try {
             $datos = $this->limpiarDatos($datos);
+
+            if ($this->_moduloBloqueado('altas')) {
+                return $this->res->fail('El módulo de altas está temporalmente bloqueado por Contabilidad. Las altas ya pendientes se pueden seguir ingresando con normalidad.');
+            }
+
             $idBodega = (int)($datos->id_bodega_destino ?? 0);
             $idProd = (int)($datos->id_producto ?? 0);
             $idUnidad = (int)($datos->id_unidad ?? 0);
@@ -7013,6 +7044,13 @@ WHERE p.activo = 1 {$whereBusqueda} {$whereMatriz}";
                 return $this->res->fail('Acceso denegado: No se localizó una sesión de usuario activa en el servidor');
             }
 
+// Bloqueo operativo configurable por Contabilidad (ej. durante el cierre mensual):
+// se detiene la creación de solicitudes nuevas, pero las ya reservadas se pueden seguir
+// entregando o rechazando con normalidad, para poder llegar a cero pendientes.
+            if ($this->_moduloBloqueado('solicitudes')) {
+                return $this->res->fail('El módulo de solicitudes está temporalmente bloqueado por Contabilidad. Las solicitudes ya reservadas pueden seguir entregándose o rechazándose con normalidad.');
+            }
+
             $datos       = $this->limpiarDatos($datos);
             $idBodega    = (int)($datos->id_bodega ?? 0);
             $idProducto  = (int)($datos->id_producto ?? 0);
@@ -7981,48 +8019,200 @@ FROM
      *   fecha_corte: string (YYYY-MM-DD HH:MM:SS)
      * }
      */
+    /**
+     * POST: bodega_inventario/crearCierre
+     * Ejecuta el cierre mensual: valida que no existan solicitudes Reservadas
+     * pendientes, registra el cierre, y calcula/guarda el cuadre completo
+     * (resumen por bodega/producto en saldos_cierre_bodega, y el detalle por
+     * lote en saldos_cierre_lote) arrastrando el saldo del cierre anterior.
+     */
     public function crearCierre($datos): array
     {
         try {
-            $datos = $this->limpiarDatos($datos);
+            $this->_inicializarNotificacionHelper();
 
-            // Permisos
             if (!$this->_esCierresAdmin()) {
-                return $this->res->fail(
-                    'No tiene permisos para ejecutar cierres. Se requiere rol de contabilidad/administrador.'
-                );
+                return $this->res->fail('No tiene permisos para ejecutar cierres. Se requiere rol de contabilidad/administrador.');
             }
 
-            // Validación de la fecha de corte (con hora)
-            if (empty($datos->fecha_corte) || !$this->_esFechaValida($datos->fecha_corte)) {
-                return $this->res->fail('La fecha de corte es requerida y debe tener formato YYYY-MM-DD HH:MM:SS');
+            $datos = $this->limpiarDatos($datos);
+            $fechaCorte = trim($datos->fecha_corte ?? '');
+
+            $fechaValida = \DateTime::createFromFormat('Y-m-d H:i:s', $fechaCorte);
+            if ($fechaCorte === '' || !$fechaValida || $fechaValida->format('Y-m-d H:i:s') !== $fechaCorte) {
+                return $this->res->fail('El campo fecha_corte es requerido y debe tener el formato AAAA-MM-DD HH:MM:SS');
+            }
+
+            // Parte 1 (H3): bloqueo si existen solicitudes Reservadas sin atender
+            $stmtPendientes = $this->connect->prepare(
+                "SELECT COUNT(*) AS total FROM bodega_inventario.solicitudes WHERE id_estado = 1"
+            );
+            $stmtPendientes->execute();
+            $totalPendientes = (int)$stmtPendientes->fetchColumn();
+
+            if ($totalPendientes > 0) {
+                $this->solicitudNotificacionHelper->notificarCierreConPendientes($totalPendientes);
+                return $this->res->fail(
+                    "No se puede ejecutar el cierre: existen {$totalPendientes} solicitud(es) en estado Reservada sin atender. " .
+                    "Deben entregarse, rechazarse o cancelarse antes de cerrar el mes."
+                );
             }
 
             $this->connect->beginTransaction();
 
-            $sql = "INSERT INTO bodega_inventario.cierres_mensuales 
-                (fecha_corte, id_usuario_ejecutor) 
-            VALUES (?, ?)";
+            // Registro del cierre
+            $stmtInsert = $this->connect->prepare(
+                "INSERT INTO bodega_inventario.cierres_mensuales
+                (fecha_corte, id_usuario_ejecutor, fecha_ejecucion)
+             VALUES (?, ?, CURRENT_TIMESTAMP)"
+            );
+            $stmtInsert->execute([$fechaCorte, $this->idUsuario]);
+            $nuevoId = (int)$this->connect->lastInsertId();
 
-            $stmt = $this->connect->prepare($sql);
-            $stmt->execute([
-                $datos->fecha_corte,
-                $this->idUsuario,   // ← ajustar a la propiedad real del usuario en sesión (char(30))
-            ]);
+            // Parte 3 (H3 + detalle por lote): cuadre completo por bodega/producto/unidad
+            $fechaCorteAnterior = $this->connect->query(
+                "SELECT fecha_corte FROM bodega_inventario.cierres_mensuales
+             WHERE id != {$nuevoId} ORDER BY fecha_corte DESC LIMIT 1"
+            )->fetchColumn();
+            $fechaCorteAnterior = $fechaCorteAnterior ?: null;
 
-            $nuevoId = $this->connect->lastInsertId();
+            $stockActual = $this->connect->query(
+                "SELECT id_bodega, id_producto, id_unidad FROM bodega_inventario.stock"
+            )->fetchAll(PDO::FETCH_ASSOC);
+
+            $sqlSaldoAnterior = $this->connect->prepare(
+                "SELECT saldo_final FROM bodega_inventario.saldos_cierre_bodega sc
+             INNER JOIN bodega_inventario.cierres_mensuales cm ON cm.id = sc.id_cierre
+             WHERE sc.id_bodega = ? AND sc.id_producto = ? AND sc.id_unidad = ?
+             ORDER BY cm.fecha_corte DESC LIMIT 1"
+            );
+
+            $sqlMovimientos = $this->connect->prepare(
+                "SELECT id_tipo_movimiento, SUM(cantidad) AS total
+             FROM bodega_inventario.movimientos_stock
+             WHERE id_bodega = ? AND id_producto = ? AND id_unidad = ?
+               AND created_at <= ?" . ($fechaCorteAnterior ? " AND created_at > ?" : "") . "
+             GROUP BY id_tipo_movimiento"
+            );
+
+            $sqlInsertSaldo = $this->connect->prepare(
+                "INSERT INTO bodega_inventario.saldos_cierre_bodega
+                (id_cierre, id_bodega, id_producto, id_unidad, saldo_inicial,
+                 total_altas, total_traslados_entrada, total_devoluciones,
+                 total_bajas, total_traslados_salida, precio_unitario_cierre)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            );
+
+            $sqlInsertLote = $this->connect->prepare(
+                "INSERT INTO bodega_inventario.saldos_cierre_lote
+                (id_cierre, tipo_lote, id_lote_origen, id_bodega, id_producto, id_unidad,
+                 cantidad_disponible, precio_unitario, fecha_referencia, serie, resolucion,
+                 correlativo_inicial, correlativo_final)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            );
+
+            foreach ($stockActual as $s) {
+                $idBodega   = (int)$s['id_bodega'];
+                $idProducto = (int)$s['id_producto'];
+                $idUnidad   = (int)$s['id_unidad'];
+
+                // Saldo inicial = saldo_final del cierre anterior para esta combinacion (0 si es la primera vez)
+                $sqlSaldoAnterior->execute([$idBodega, $idProducto, $idUnidad]);
+                $saldoInicial = (float)($sqlSaldoAnterior->fetchColumn() ?: 0);
+
+                // Movimientos desde el cierre anterior hasta este
+                $params = $fechaCorteAnterior
+                    ? [$idBodega, $idProducto, $idUnidad, $fechaCorte, $fechaCorteAnterior]
+                    : [$idBodega, $idProducto, $idUnidad, $fechaCorte];
+                $sqlMovimientos->execute($params);
+                $movs = array_column($sqlMovimientos->fetchAll(PDO::FETCH_ASSOC), 'total', 'id_tipo_movimiento');
+
+                $totalAltas            = (float)($movs[1] ?? 0) + (float)($movs[4] ?? 0); // Alta por compra + Alta directa
+                $totalTrasladosEntrada = (float)($movs[2] ?? 0); // Alta por traslado
+                $totalDevoluciones     = (float)($movs[3] ?? 0); // Alta por reversa
+                $totalBajas            = (float)($movs[5] ?? 0) + (float)($movs[7] ?? 0) + (float)($movs[11] ?? 0); // Entrega + Entrega directa + Reversa de alta
+                $totalTrasladosSalida  = (float)($movs[6] ?? 0); // Baja por traslado
+
+                // Tipo de producto (para saber que tabla de lotes usar; correlativo=1 no tiene id_unidad)
+                $idTipoProducto = (int)$this->connect->query(
+                    "SELECT id_tipo FROM bodega_inventario.productos WHERE id = {$idProducto}"
+                )->fetchColumn();
+
+                if ($idTipoProducto === 1) {
+                    $tipoLote = 'Correlativo';
+                    $stmtLotesDetalle = $this->connect->prepare(
+                        "SELECT id, cantidad_disponible, precio_unitario, created_at AS fecha_referencia,
+                            serie, resolucion, correlativo_inicial, correlativo_final
+                     FROM bodega_inventario.lotes_correlativo
+                     WHERE id_bodega = ? AND id_producto = ? AND cantidad_disponible > 0"
+                    );
+                    $stmtLotesDetalle->execute([$idBodega, $idProducto]);
+
+                    $stmtPrecio = $this->connect->prepare(
+                        "SELECT SUM(cantidad_disponible * precio_unitario) / NULLIF(SUM(cantidad_disponible), 0) AS precio_promedio
+                     FROM bodega_inventario.lotes_correlativo
+                     WHERE id_bodega = ? AND id_producto = ? AND cantidad_disponible > 0"
+                    );
+                    $stmtPrecio->execute([$idBodega, $idProducto]);
+                } else {
+                    $tabla = $idTipoProducto === 2 ? 'lotes_expiracion' : 'lotes_normal';
+                    $tipoLote = $idTipoProducto === 2 ? 'Expiracion' : 'Normal';
+                    $campoFecha = $idTipoProducto === 2 ? 'fecha_expiracion' : 'fecha_ingreso';
+
+                    $stmtLotesDetalle = $this->connect->prepare(
+                        "SELECT id, cantidad_disponible, precio_unitario, {$campoFecha} AS fecha_referencia
+                     FROM bodega_inventario.{$tabla}
+                     WHERE id_bodega = ? AND id_producto = ? AND id_unidad = ? AND cantidad_disponible > 0"
+                    );
+                    $stmtLotesDetalle->execute([$idBodega, $idProducto, $idUnidad]);
+
+                    $stmtPrecio = $this->connect->prepare(
+                        "SELECT SUM(cantidad_disponible * precio_unitario) / NULLIF(SUM(cantidad_disponible), 0) AS precio_promedio
+                     FROM bodega_inventario.{$tabla}
+                     WHERE id_bodega = ? AND id_producto = ? AND id_unidad = ? AND cantidad_disponible > 0"
+                    );
+                    $stmtPrecio->execute([$idBodega, $idProducto, $idUnidad]);
+                }
+
+                $precioPromedio = $stmtPrecio->fetchColumn();
+                $precioPromedio = $precioPromedio !== false && $precioPromedio !== null ? round((float)$precioPromedio, 4) : null;
+
+                // Resumen: saldos_cierre_bodega
+                $sqlInsertSaldo->execute([
+                    $nuevoId, $idBodega, $idProducto, $idUnidad, $saldoInicial,
+                    $totalAltas, $totalTrasladosEntrada, $totalDevoluciones,
+                    $totalBajas, $totalTrasladosSalida, $precioPromedio,
+                ]);
+
+                // Detalle: saldos_cierre_lote (una fila por cada lote activo)
+                $lotesDetalle = $stmtLotesDetalle->fetchAll(PDO::FETCH_ASSOC);
+                foreach ($lotesDetalle as $ld) {
+                    $sqlInsertLote->execute([
+                        $nuevoId,
+                        $tipoLote,
+                        (int)$ld['id'],
+                        $idBodega,
+                        $idProducto,
+                        $idTipoProducto === 1 ? null : $idUnidad,
+                        (float)$ld['cantidad_disponible'],
+                        $ld['precio_unitario'] !== null ? (float)$ld['precio_unitario'] : null,
+                        $ld['fecha_referencia'] ?? null,
+                        $ld['serie'] ?? null,
+                        $ld['resolucion'] ?? null,
+                        $ld['correlativo_inicial'] ?? null,
+                        $ld['correlativo_final'] ?? null,
+                    ]);
+                }
+            }
+
             $this->connect->commit();
 
-            return $this->res->ok('Cierre registrado correctamente', null, [
-                'id' => (int)$nuevoId
-            ]);
+            return $this->res->ok('Cierre mensual ejecutado correctamente', ['id_cierre' => $nuevoId]);
 
         } catch (Exception $e) {
-            if ($this->connect->inTransaction()) {
-                $this->connect->rollBack();
-            }
+            if ($this->connect->inTransaction()) $this->connect->rollBack();
             error_log("Error en crearCierre: " . $e->getMessage());
-            return $this->res->fail('Error al registrar el cierre', $e);
+            return $this->res->fail('Error al ejecutar el cierre mensual', $e);
         }
     }
 
@@ -8164,11 +8354,16 @@ FROM
     // =========================================================================
 
     /** Indica si el puesto en sesión puede gestionar cierres. */
+
     private function _esCierresAdmin(): bool
     {
-        return in_array($this->puesto, [1, 3, 56], true);
+        return in_array($this->puesto, [
+            9,  // CONTADOR GENERAL
+            10, // AUXILIAR CONTABILIDAD
+            3,  // GERENTE ADMINISTRATIVO FINANCIERO (respaldo jerárquico)
+            56, //Programador
+        ], true);
     }
-
     /** Indica si el ID dado corresponde al cierre con fecha_corte más reciente. */
     private function _esUltimoCierre(int $id): bool
     {
@@ -8304,7 +8499,7 @@ FROM
 
             $this->connect->commit();
             $this->_inicializarNotificacionHelper();
-            $this->solicitudNotificacionHelper->notificarRechazada($idDetalle, $motivo);
+            $this->solicitudNotificacionHelper->notificarRevertida($idDetalle);
 
             return $this->res->ok('La entrega fue revertida y las existencias regresaron a su lote de origen', [
                 'id_solicitud_detalle' => $idDetalle,
@@ -8615,6 +8810,11 @@ FROM
     public function crearTraslado($datos): array
     {
         try {
+
+            if ($this->_moduloBloqueado('traslados')) {
+                return $this->res->fail('El módulo de traslados está temporalmente bloqueado por Contabilidad. Los traslados ya pendientes se pueden seguir aprobando, rechazando o recibiendo con normalidad.');
+            }
+
             $this->_inicializarBodegaHelper();
             $this->_inicializarStockHelper();
             $this->_inicializarTrasladoHelper();
@@ -8844,6 +9044,10 @@ FROM
                 return $this->res->fail('El campo id_traslado es requerido y debe ser un entero positivo');
             }
 
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para aprobar traslados. Se requiere rol de Administrador de Bodegas.');
+            }
+
             $stmtCab = $this->connect->prepare(
                 "SELECT id, id_estado FROM bodega_inventario.traslados WHERE id = ? FOR UPDATE"
             );
@@ -8860,10 +9064,13 @@ FROM
 
             $this->connect->prepare(
                 "UPDATE bodega_inventario.traslados
-                 SET id_estado = 2, id_usuario_admin = ?, fecha_gestion = CURRENT_TIMESTAMP,
-                     comentario_admin = ?, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?"
+             SET id_estado = 2, id_usuario_admin = ?, fecha_gestion = CURRENT_TIMESTAMP,
+                 comentario_admin = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?"
             )->execute([$this->idUsuario, $comentario !== '' ? $comentario : null, $idTraslado]);
+
+            $this->solicitudNotificacionHelper->notificarTrasladoGestionado($idTraslado, true);
+            $this->solicitudNotificacionHelper->notificarTrasladoListoRecepcion($idTraslado);
 
             return $this->res->ok('El traslado ha sido aprobado. Queda a la espera de que la bodega destino confirme la recepción');
 
@@ -8896,6 +9103,10 @@ FROM
                 return $this->res->fail('Se requiere el id_traslado y el comentario (motivo del rechazo)');
             }
 
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para rechazar traslados. Se requiere rol de Administrador de Bodegas.');
+            }
+
             $this->connect->beginTransaction();
 
             $stmtCab = $this->connect->prepare(
@@ -8918,12 +9129,13 @@ FROM
 
             $this->connect->prepare(
                 "UPDATE bodega_inventario.traslados
-                 SET id_estado = 3, id_usuario_admin = ?, fecha_gestion = CURRENT_TIMESTAMP,
-                     comentario_admin = ?, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?"
+             SET id_estado = 3, id_usuario_admin = ?, fecha_gestion = CURRENT_TIMESTAMP,
+                 comentario_admin = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?"
             )->execute([$this->idUsuario, $comentario, $idTraslado]);
 
             $this->connect->commit();
+            $this->solicitudNotificacionHelper->notificarTrasladoGestionado($idTraslado, false, $comentario);
 
             return $this->res->ok('El traslado ha sido rechazado y la reserva de existencias liberada correctamente');
 
@@ -9760,6 +9972,7 @@ FROM
             $this->connect->beginTransaction();
             $this->compraAgenciaService->gestionarSolicitud($idCompra, $aprueba, $this->idUsuario, $this->puesto, $comentario, $lineas);
             $this->connect->commit();
+            $this->solicitudNotificacionHelper->notificarCompraGestionada($idCompra, $aprueba, $comentario);
 
             return $this->res->ok('La solicitud fue gestionada correctamente', ['id_compra' => $idCompra]);
         } catch (Exception $e) {
@@ -11566,7 +11779,10 @@ FROM
                     : 'El usuario en sesión no posee una bodega de área asignada bajo su cargo';
                 return $this->res->fail($msg);
             }
-
+            
+            if ($this->_moduloBloqueado('entregas_directas')) {
+                return $this->res->fail('El módulo de entregas directas está temporalmente bloqueado por Contabilidad. Intente más tarde.');
+            }
             // Guard clause: la bodega debe tener habilitada la Entrega Directa
             $this->entregaDirectaHelper->validarBodegaHabilitada($idBodega);
 
@@ -11999,6 +12215,10 @@ FROM
         try {
             $this->_inicializarFacturaBodegaHelper();
 
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para solicitar correcciones de facturas. Se requiere rol de Contabilidad.');
+            }
+
             $datos  = $this->limpiarDatos($datos);
             $id     = (int)($datos->id ?? 0);
             $motivo = trim($datos->motivo ?? '');
@@ -12066,6 +12286,10 @@ FROM
     {
         try {
             $this->_inicializarFacturaBodegaHelper();
+
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para verificar facturas. Se requiere rol de Contabilidad.');
+            }
 
             $datos = $this->limpiarDatos($datos);
             $id    = (int)($datos->id ?? 0);
@@ -12244,6 +12468,1379 @@ FROM
     {
         // TODO: conectar con tu sistema de roles/permisos
         return true;
+    }
+
+
+    /**
+     * Verifica si un módulo operativo está bloqueado por Contabilidad
+     * (configuracion_sistema: modulo + clave 'bloqueado' = 'true').
+     */
+    private function _moduloBloqueado(string $modulo): bool
+    {
+        $stmt = $this->connect->prepare(
+            "SELECT valor FROM bodega_inventario.configuracion_sistema
+         WHERE modulo = ? AND clave = 'bloqueado' AND activo = 1
+         LIMIT 1"
+        );
+        $stmt->execute([$modulo]);
+        $valor = $stmt->fetchColumn();
+
+        return $valor !== false && filter_var($valor, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /**
+     * POST: bodega_inventario/toggleBloqueoModulo
+     * Body: { modulo: string, bloqueado: bool }
+     * Permite a Contabilidad bloquear/desbloquear un módulo operativo puntual
+     * (por ejemplo durante el cierre mensual), sin tocar código.
+     */
+    public function toggleBloqueoModulo($datos): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para modificar bloqueos del sistema. Se requiere rol de contabilidad/administrador.');
+            }
+
+            $datos     = $this->limpiarDatos($datos);
+            $modulo    = trim($datos->modulo ?? '');
+            $bloqueado = filter_var($datos->bloqueado ?? false, FILTER_VALIDATE_BOOLEAN);
+
+            // Lista blanca: solo estos módulos se pueden bloquear desde aquí
+            $modulosValidos = ['solicitudes', 'entregas_directas', 'altas', 'traslados'];
+            if (!in_array($modulo, $modulosValidos, true)) {
+                return $this->res->fail('Módulo no válido. Opciones: ' . implode(', ', $modulosValidos));
+            }
+
+            $stmt = $this->connect->prepare(
+                "INSERT INTO bodega_inventario.configuracion_sistema
+                (modulo, clave, valor, tipo_dato, descripcion, activo)
+             VALUES (?, 'bloqueado', ?, 'boolean', 'Bloqueo operativo temporal (cierre mensual)', 1)
+             ON DUPLICATE KEY UPDATE valor = VALUES(valor), updated_at = CURRENT_TIMESTAMP"
+            );
+            $stmt->execute([$modulo, $bloqueado ? 'true' : 'false']);
+
+            return $this->res->ok($bloqueado
+                ? "El módulo '{$modulo}' quedó bloqueado."
+                : "El módulo '{$modulo}' quedó desbloqueado.");
+        } catch (Exception $e) {
+            error_log("Error en toggleBloqueoModulo: " . $e->getMessage());
+            return $this->res->fail('Error al actualizar el bloqueo', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerBloqueosModulos
+     * Devuelve el estado actual de los modulos operativos bloqueables por Contabilidad.
+     * La lista de modulos es fija (whitelist) -- el front no puede agregar nuevos,
+     * solo leer/alternar el estado de estos.
+     */
+    public function obtenerBloqueosModulos(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar los bloqueos del sistema. Se requiere rol de contabilidad/administrador.');
+            }
+
+            // Misma whitelist que toggleBloqueoModulo, en el mismo orden -- unica fuente de verdad
+            $modulosValidos = [
+                'solicitudes'       => 'Creación de solicitudes nuevas (agencia y área)',
+                'entregas_directas' => 'Confirmación de entregas directas',
+                'altas'             => 'Creación de altas manuales de mercancía',
+                'traslados'         => 'Creación de traslados nuevos entre bodegas',
+            ];
+
+            $stmt = $this->connect->prepare(
+                "SELECT modulo, valor FROM bodega_inventario.configuracion_sistema
+             WHERE modulo = ? AND clave = 'bloqueado' AND activo = 1
+             LIMIT 1"
+            );
+
+            $resultado = [];
+            foreach ($modulosValidos as $modulo => $descripcion) {
+                $stmt->execute([$modulo]);
+                $valor = $stmt->fetchColumn();
+                $resultado[] = [
+                    'modulo'      => $modulo,
+                    'descripcion' => $descripcion,
+                    'bloqueado'   => $valor !== false && filter_var($valor, FILTER_VALIDATE_BOOLEAN),
+                ];
+            }
+
+            return $this->res->ok('Estado de bloqueos obtenido', $resultado);
+        } catch (Exception $e) {
+            error_log("Error en obtenerBloqueosModulos: " . $e->getMessage());
+            return $this->res->fail('Error al consultar los bloqueos', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerComprasEnTransito
+     * Reporte de conciliación para Contabilidad: suma el valor de compras ya
+     * pagadas/comprometidas (estado Comprado o Enviado) que AÚN no se han
+     * registrado en existencias físicas (no llegan a Registrada), agrupado
+     * por bodega. Este valor no aparece en movimientos_stock ni en
+     * saldos_cierre_bodega porque todavía no es inventario físico -- es dinero
+     * ya comprometido con el proveedor que hay que explicar aparte al comparar
+     * contra las facturas pagadas.
+     */
+    public function obtenerComprasEnTransito(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Contabilidad.');
+            }
+
+            $stmt = $this->connect->query(
+                "SELECT b.id AS id_bodega, b.nombre AS bodega,
+                    ec.nombre AS estado,
+                    COUNT(DISTINCT c.id) AS total_compras,
+                    SUM(cd.cantidad_solicitada * cd.precio_unitario) AS valor_comprometido
+             FROM bodega_inventario.compras c
+             INNER JOIN bodega_inventario.bodegas b ON b.id = c.id_bodega
+             INNER JOIN bodega_inventario.estados_compra_v2 ec ON ec.id = c.id_estado
+             INNER JOIN bodega_inventario.compras_detalle cd ON cd.id_compra = c.id
+             WHERE c.id_estado IN (5, 6) -- 5 = Comprado, 6 = Enviado (aún no Registrado)
+               AND cd.precio_unitario IS NOT NULL
+             GROUP BY b.id, b.nombre, ec.nombre
+             ORDER BY b.nombre, ec.nombre"
+            );
+
+            return $this->res->ok('Valor en tránsito calculado', $stmt->fetchAll(PDO::FETCH_ASSOC));
+        } catch (Exception $e) {
+            error_log("Error en obtenerComprasEnTransito: " . $e->getMessage());
+            return $this->res->fail('Error al calcular el valor en tránsito', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerAlertasVencimiento?contexto=area|agencia
+     * Devuelve los lotes de expiración de la bodega del usuario en sesión
+     * que caen dentro de algún umbral de alerta activo (30/60/90 días u
+     * otro configurado), agrupados por el umbral que los detectó.
+     * Los ya vencidos se devuelven aparte, en "vencidos".
+     */
+    public function obtenerAlertasVencimiento(): array
+    {
+        try {
+            $this->_inicializarBodegaHelper();
+
+            $contexto = trim($_GET['contexto'] ?? 'area');
+            if (!in_array($contexto, ['area', 'agencia'], true)) {
+                return $this->res->fail('El campo contexto es requerido y debe ser "area" o "agencia"');
+            }
+
+            $idBodega = (int)$this->bodegaHelper->obtenerBodegaPorContexto($contexto);
+            if (!$idBodega) {
+                return $this->res->fail('El usuario en sesión no posee una bodega asignada bajo su cargo');
+            }
+
+            // Umbrales activos para esta bodega: los específicos de la bodega
+            // tienen prioridad; si no hay ninguno específico, se usan los globales (id_bodega IS NULL)
+            $stmtUmbrales = $this->connect->prepare(
+                "SELECT dias_anticipacion
+             FROM bodega_inventario.alertas_vencimiento_config
+             WHERE activo = 1 AND (id_bodega = ? OR id_bodega IS NULL)
+             ORDER BY dias_anticipacion ASC"
+            );
+            $stmtUmbrales->execute([$idBodega]);
+            $umbrales = array_map('intval', $stmtUmbrales->fetchAll(PDO::FETCH_COLUMN));
+
+            if (empty($umbrales)) {
+                return $this->res->info('No hay umbrales de alerta configurados', null, ['umbrales' => [], 'lotes' => [], 'vencidos' => []]);
+            }
+
+            $umbralMayor = max($umbrales);
+
+            $stmtLotes = $this->connect->prepare(
+                "SELECT le.id, le.id_producto, p.nombre AS producto, le.fecha_expiracion,
+                    le.cantidad_disponible, le.id_unidad, u.abreviatura,
+                    DATEDIFF(le.fecha_expiracion, CURDATE()) AS dias_restantes
+             FROM bodega_inventario.lotes_expiracion le
+             INNER JOIN bodega_inventario.productos p ON p.id = le.id_producto
+             INNER JOIN bodega_inventario.unidades_medida u ON u.id = le.id_unidad
+             WHERE le.id_bodega = ?
+               AND le.cantidad_disponible > 0
+               AND le.fecha_expiracion IS NOT NULL
+               AND DATEDIFF(le.fecha_expiracion, CURDATE()) <= ?
+             ORDER BY le.fecha_expiracion ASC"
+            );
+            $stmtLotes->execute([$idBodega, $umbralMayor]);
+            $todos = $stmtLotes->fetchAll(PDO::FETCH_ASSOC);
+
+            // Próximos a vencer (0 a umbral) -- mismo comportamiento y forma que siempre tuvo "lotes"
+            $lotes = array_values(array_filter($todos, fn($l) => (int)$l['dias_restantes'] >= 0));
+            foreach ($lotes as &$lote) {
+                $lote['umbral_alcanzado'] = null;
+                foreach ($umbrales as $u) {
+                    if ((int)$lote['dias_restantes'] <= $u) {
+                        $lote['umbral_alcanzado'] = $u;
+                        break;
+                    }
+                }
+            }
+            unset($lote);
+
+            // Ya vencidos -- aparte, para no alterar la forma de "lotes"
+            $vencidos = array_values(array_filter($todos, fn($l) => (int)$l['dias_restantes'] < 0));
+
+            if (empty($lotes) && empty($vencidos)) {
+                return $this->res->info('No hay lotes próximos a vencer dentro de los umbrales configurados', null, ['umbrales' => $umbrales, 'lotes' => [], 'vencidos' => []]);
+            }
+
+            return $this->res->ok('Alertas de vencimiento obtenidas correctamente', [
+                'umbrales' => $umbrales,
+                'lotes'    => $lotes,
+                'vencidos' => $vencidos,
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerAlertasVencimiento: " . $e->getMessage());
+            return $this->res->fail('Error al obtener las alertas de vencimiento', $e);
+        }
+    }
+    /**
+     * GET: bodega_inventario/obtenerAlertasVencimientoGlobal?id_agencia=&id_producto=&umbral=
+     * Igual que obtenerAlertasVencimiento pero sin restringirse a "mi bodega" --
+     * para el Administrador de Bodegas, con filtro por agencia y producto.
+     * Los ya vencidos se devuelven aparte, en "vencidos".
+     */
+    public function obtenerAlertasVencimientoGlobal(): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $idAgencia    = filter_input(INPUT_GET, 'id_agencia', FILTER_VALIDATE_INT) ?: null;
+            $idProducto   = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT) ?: null;
+            $umbralFiltro = filter_input(INPUT_GET, 'umbral', FILTER_VALIDATE_INT) ?: null;
+
+            // Umbral mas amplio a considerar (global + por bodega, para cubrir todos los casos)
+            $umbralMayor = (int)$this->connect->query(
+                "SELECT COALESCE(MAX(dias_anticipacion), 0)
+             FROM bodega_inventario.alertas_vencimiento_config WHERE activo = 1"
+            )->fetchColumn();
+
+            if ($umbralMayor < 1) {
+                return $this->res->info('No hay umbrales de alerta configurados', null, ['lotes' => [], 'vencidos' => []]);
+            }
+
+            $sql = "SELECT le.id, le.id_bodega, b.nombre AS bodega, b.id_tipo as tipo_bodega, b.id_agencia,
+                       le.id_producto, p.nombre AS producto, le.fecha_expiracion,
+                       le.cantidad_disponible, le.id_unidad, u.abreviatura,
+                       DATEDIFF(le.fecha_expiracion, CURDATE()) AS dias_restantes,
+                       COALESCE(
+                           (SELECT MIN(dias_anticipacion) FROM bodega_inventario.alertas_vencimiento_config
+                            WHERE activo = 1 AND (id_bodega = le.id_bodega OR id_bodega IS NULL)
+                              AND dias_anticipacion >= DATEDIFF(le.fecha_expiracion, CURDATE())),
+                       NULL) AS umbral_alcanzado
+                FROM bodega_inventario.lotes_expiracion le
+                INNER JOIN bodega_inventario.productos p ON p.id = le.id_producto
+                INNER JOIN bodega_inventario.bodegas b ON b.id = le.id_bodega
+                INNER JOIN bodega_inventario.unidades_medida u ON u.id = le.id_unidad
+                WHERE le.cantidad_disponible > 0
+                  AND le.fecha_expiracion IS NOT NULL
+                  AND DATEDIFF(le.fecha_expiracion, CURDATE()) <= ?";
+            $params = [$umbralMayor];
+
+            if ($idAgencia)  { $sql .= " AND b.id_agencia = ?";  $params[] = $idAgencia; }
+            if ($idProducto) { $sql .= " AND le.id_producto = ?"; $params[] = $idProducto; }
+
+            $sql .= " ORDER BY le.fecha_expiracion ASC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $todos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $lotes    = array_values(array_filter($todos, fn($l) => (int)$l['dias_restantes'] >= 0));
+            $vencidos = array_values(array_filter($todos, fn($l) => (int)$l['dias_restantes'] < 0));
+
+            // El filtro de umbral especifico se aplica solo sobre "lotes" (los vencidos no tienen umbral_alcanzado util)
+            if ($umbralFiltro) {
+                $lotes = array_values(array_filter($lotes, fn($l) => (int)$l['umbral_alcanzado'] === $umbralFiltro));
+            }
+
+            if (empty($lotes) && empty($vencidos)) {
+                return $this->res->info('No hay lotes próximos a vencer con los filtros aplicados', null, ['lotes' => [], 'vencidos' => []]);
+            }
+
+            return $this->res->ok('Alertas de vencimiento obtenidas correctamente', [
+                'lotes'    => $lotes,
+                'vencidos' => $vencidos,
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerAlertasVencimientoGlobal: " . $e->getMessage());
+            return $this->res->fail('Error al obtener las alertas de vencimiento', $e);
+        }
+    }
+
+    /**
+     * POST: bodega_inventario/notificarAlertaVencimiento
+     * Body: { id_lote: int, comentario?: string, id_usuario_destino?: string }
+     *
+     * Bodega de AREA: se notifica automáticamente al/los encargado(s) asignados
+     * (igual que antes).
+     * Bodega de AGENCIA: no existe un encargado asignado en el sistema, por lo
+     * que el Administrador de Bodegas DEBE indicar id_usuario_destino (elegido
+     * de un buscador de usuarios); en este caso, ademas de la notificación
+     * interna, se envía un correo electrónico con la información.
+     */
+    public function notificarAlertaVencimiento($datos): array
+    {
+        try {
+            $this->_inicializarNotificacionHelper();
+
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para enviar esta notificación. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $datos      = $this->limpiarDatos($datos);
+            $idLote     = (int)($datos->id_lote ?? 0);
+            $comentario = trim($datos->comentario ?? '');
+            $idUsuarioDestino = trim($datos->id_usuario_destino ?? '');
+
+            if ($idLote < 1) {
+                return $this->res->fail('El campo id_lote es requerido');
+            }
+
+            // Ubicar el lote y el tipo de bodega al que pertenece
+            $stmt = $this->connect->prepare(
+                "SELECT le.id_bodega, b.id_tipo, b.nombre AS bodega,
+                    p.nombre AS producto, le.fecha_expiracion, le.cantidad_disponible,
+                    DATEDIFF(le.fecha_expiracion, CURDATE()) AS dias_restantes
+             FROM bodega_inventario.lotes_expiracion le
+             INNER JOIN bodega_inventario.bodegas b ON b.id = le.id_bodega
+             INNER JOIN bodega_inventario.productos p ON p.id = le.id_producto
+             WHERE le.id = ? LIMIT 1"
+            );
+            $stmt->execute([$idLote]);
+            $lote = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$lote) {
+                return $this->res->fail('El lote especificado no existe');
+            }
+
+            $esAgencia = (int)$lote['id_tipo'] === 1; // 1 = Agencia (TIPO_BODEGA_AREA = 2, ya usado en SolicitudNotificacionHelper)
+
+            if (!$esAgencia) {
+                // Bodega de AREA: comportamiento original, encargado(s) automaticos
+                $this->solicitudNotificacionHelper->notificarAlertaVencimiento($idLote, $comentario !== '' ? $comentario : null);
+                return $this->res->ok('Notificación enviada al encargado de la bodega correspondiente');
+            }
+
+            // Bodega de AGENCIA: no hay encargado asignado -- se requiere seleccion manual
+            if ($idUsuarioDestino === '') {
+                return $this->res->fail('Esta bodega es de tipo Agencia y no tiene un encargado asignado en el sistema. Debe indicar id_usuario_destino.');
+            }
+
+            $stmtUsuario = $this->connect->prepare(
+                "SELECT u.idUsuarios, dp.nombres, dp.correoElectronico
+             FROM dbintranet.usuarios u
+             INNER JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = u.idDatosPersonales
+             WHERE u.idUsuarios = ? AND u.idEstados = 1
+             LIMIT 1"
+            );
+            $stmtUsuario->execute([$idUsuarioDestino]);
+            $usuario = $stmtUsuario->fetch(PDO::FETCH_ASSOC);
+
+            if (!$usuario) {
+                return $this->res->fail('El usuario destino indicado no existe o no está activo');
+            }
+
+            $diasRestantes = (int)$lote['dias_restantes'];
+            $fraseVencimiento = $diasRestantes < 0
+                ? "venció hace " . abs($diasRestantes) . " día(s)"
+                : "vence en {$diasRestantes} día(s)";
+
+            $texto = "Alerta de vencimiento: {$lote['producto']} en {$lote['bodega']} {$fraseVencimiento} "
+                . "({$lote['cantidad_disponible']} unidades disponibles)";
+            if ($comentario !== '') {
+                $texto .= ' — ' . $comentario;
+            }
+
+            // 1) Notificación interna (en sistema), igual que siempre
+            $this->notificacionHelper->enviar($usuario['idUsuarios'], $texto);
+
+            // 2) Correo electronico -- solo en esta rama, porque no hay encargado fijo que ya vea las notificaciones internas
+            $avisoCorreo = null;
+            if (!empty($usuario['correoElectronico'])) {
+                $asunto = "Alerta de vencimiento — {$lote['producto']} ({$lote['bodega']})";
+                $cuerpo = "<h2>Alerta de vencimiento de inventario</h2>"
+                    . "<p><strong>Producto:</strong> {$lote['producto']}</p>"
+                    . "<p><strong>Bodega:</strong> {$lote['bodega']}</p>"
+                    . "<p><strong>" . ($diasRestantes < 0 ? "Venció hace" : "Vence en") . ":</strong> "
+                    . abs($diasRestantes) . " día(s)</p>"
+                    . "<p><strong>Cantidad disponible:</strong> {$lote['cantidad_disponible']}</p>"
+                    . ($comentario !== '' ? "<p><strong>Comentario:</strong> {$comentario}</p>" : "");
+
+                $resultadoMail = $this->mailer->enviar($usuario['correoElectronico'], $asunto, $cuerpo);
+                if (!isset($resultadoMail['respuesta']) || $resultadoMail['respuesta'] !== 'success') {
+                    $avisoCorreo = 'La notificación interna sí se envió, pero el correo electrónico falló: ' . ($resultadoMail['mensaje'] ?? 'error desconocido');
+                }
+            } else {
+                $avisoCorreo = 'La notificación interna sí se envió, pero el usuario no tiene un correo electrónico registrado.';
+            }
+
+            return $avisoCorreo
+                ? $this->res->info($avisoCorreo)
+                : $this->res->ok("Notificación enviada a {$usuario['nombres']} (interna + correo electrónico)");
+
+        } catch (Exception $e) {
+            error_log("Error en notificarAlertaVencimiento: " . $e->getMessage());
+            return $this->res->fail('Error al enviar la notificación', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/listarConfigAlertasVencimiento
+     * Lista todos los umbrales configurados (globales y por bodega).
+     */
+    public function listarConfigAlertasVencimiento(): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para consultar la configuración de alertas. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $stmt = $this->connect->query(
+                "SELECT avc.id, avc.id_bodega, b.nombre AS bodega, avc.dias_anticipacion, avc.activo
+             FROM bodega_inventario.alertas_vencimiento_config avc
+             LEFT JOIN bodega_inventario.bodegas b ON b.id = avc.id_bodega
+             ORDER BY (avc.id_bodega IS NULL) DESC, b.nombre, avc.dias_anticipacion"
+            );
+
+            return $this->res->ok('Configuración de alertas obtenida', $stmt->fetchAll(PDO::FETCH_ASSOC));
+        } catch (Exception $e) {
+            error_log("Error en listarConfigAlertasVencimiento: " . $e->getMessage());
+            return $this->res->fail('Error al listar la configuración de alertas', $e);
+        }
+    }
+    /**
+     * POST: bodega_inventario/guardarConfigAlertaVencimiento
+     * Body: { dias_anticipacion: int, id_bodega?: int|null }
+     * id_bodega omitido o null = umbral global (aplica a todas las bodegas
+     * que no tengan uno propio).
+     */
+    public function guardarConfigAlertaVencimiento($datos): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para configurar alertas. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $datos            = $this->limpiarDatos($datos);
+            $diasAnticipacion = (int)($datos->dias_anticipacion ?? 0);
+            $idBodega         = !empty($datos->id_bodega) ? (int)$datos->id_bodega : null;
+
+            if ($diasAnticipacion < 1) {
+                return $this->res->fail('El campo dias_anticipacion es requerido y debe ser un entero positivo');
+            }
+
+            $stmt = $this->connect->prepare(
+                "INSERT INTO bodega_inventario.alertas_vencimiento_config (id_bodega, dias_anticipacion, activo)
+             VALUES (?, ?, 1)
+             ON DUPLICATE KEY UPDATE activo = 1, updated_at = CURRENT_TIMESTAMP"
+            );
+            $stmt->execute([$idBodega, $diasAnticipacion]);
+
+            return $this->res->ok('Umbral de alerta guardado correctamente');
+        } catch (Exception $e) {
+            error_log("Error en guardarConfigAlertaVencimiento: " . $e->getMessage());
+            return $this->res->fail('Error al guardar el umbral de alerta', $e);
+        }
+    }
+
+    /**
+     * POST: bodega_inventario/toggleConfigAlertaVencimiento
+     * Body: { id: int }
+     * Activa/desactiva (invierte) el umbral indicado.
+     */
+    public function toggleConfigAlertaVencimiento($datos): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para modificar alertas. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $id = (int)($this->limpiarDatos($datos)->id ?? 0);
+            if ($id < 1) {
+                return $this->res->fail('El campo id es requerido');
+            }
+
+            $stmt = $this->connect->prepare(
+                "UPDATE bodega_inventario.alertas_vencimiento_config
+             SET activo = NOT activo, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?"
+            );
+            $stmt->execute([$id]);
+
+            if ($stmt->rowCount() === 0) {
+                return $this->res->fail('El umbral especificado no existe');
+            }
+
+            return $this->res->ok('Estado del umbral actualizado correctamente');
+        } catch (Exception $e) {
+            error_log("Error en toggleConfigAlertaVencimiento: " . $e->getMessage());
+            return $this->res->fail('Error al actualizar el umbral', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerExistenciasCorrelativos?contexto=area|agencia&id_producto=
+     * Lista los rangos de correlativo con existencia disponible en la bodega
+     * del usuario en sesión (10.3).
+     */
+    public function obtenerExistenciasCorrelativos(): array
+    {
+        try {
+            $this->_inicializarBodegaHelper();
+
+            $contexto = trim($_GET['contexto'] ?? 'area');
+            if (!in_array($contexto, ['area', 'agencia'], true)) {
+                return $this->res->fail('El campo contexto es requerido y debe ser "area" o "agencia"');
+            }
+
+            $idBodega = (int)$this->bodegaHelper->obtenerBodegaPorContexto($contexto);
+            if (!$idBodega) {
+                return $this->res->fail('El usuario en sesión no posee una bodega asignada bajo su cargo');
+            }
+
+            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT lc.id, lc.id_producto, p.nombre AS producto,
+                       lc.serie, lc.resolucion, lc.fecha_resolucion,
+                       lc.correlativo_inicial, lc.correlativo_final, lc.correlativo_siguiente,
+                       lc.cantidad_disponible, lc.precio_unitario, lc.created_at AS fecha_alta
+                FROM bodega_inventario.lotes_correlativo lc
+                INNER JOIN bodega_inventario.productos p ON p.id = lc.id_producto
+                WHERE lc.id_bodega = ? AND lc.cantidad_disponible > 0";
+            $params = [$idBodega];
+
+            if ($idProducto) {
+                $sql .= " AND lc.id_producto = ?";
+                $params[] = $idProducto;
+            }
+            $sql .= " ORDER BY p.nombre, lc.correlativo_inicial";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $existencias = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($existencias)) {
+                return $this->res->info('No hay existencias de correlativos disponibles', null, ['existencias' => []]);
+            }
+
+            return $this->res->ok('Existencias de correlativos obtenidas', ['existencias' => $existencias]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerExistenciasCorrelativos: " . $e->getMessage());
+            return $this->res->fail('Error al obtener existencias de correlativos', $e);
+        }
+    }
+    /**
+     * GET: bodega_inventario/obtenerConsumosCorrelativos?contexto=area|agencia&desde=&hasta=
+     * Lista las entregas de correlativo (10.4): rango entregado, receptor, fecha, bodega origen.
+     * Incluye el segundo rango cuando la entrega cruzó dos lotes.
+     */
+    public function obtenerConsumosCorrelativos(): array
+    {
+        try {
+            $this->_inicializarBodegaHelper();
+
+            $contexto = trim($_GET['contexto'] ?? 'area');
+            if (!in_array($contexto, ['area', 'agencia'], true)) {
+                return $this->res->fail('El campo contexto es requerido y debe ser "area" o "agencia"');
+            }
+
+            $idBodega = (int)$this->bodegaHelper->obtenerBodegaPorContexto($contexto);
+            if (!$idBodega) {
+                return $this->res->fail('El usuario en sesión no posee una bodega asignada bajo su cargo');
+            }
+
+            $desde = filter_input(INPUT_GET, 'desde', FILTER_SANITIZE_SPECIAL_CHARS) ?: null;
+            $hasta = filter_input(INPUT_GET, 'hasta', FILTER_SANITIZE_SPECIAL_CHARS) ?: null;
+
+            $sql = "SELECT sd.id AS id_detalle, s.id AS id_solicitud, p.nombre AS producto,
+                       sd.correlativo_inicial_asignado, sd.correlativo_final_asignado,
+                       sd.correlativo_inicial_asignado_2, sd.correlativo_final_asignado_2,
+                       sd.cantidad_entregada, sd.fecha_gestion,
+                       s.id_usuario AS id_receptor, dp.nombres AS receptor,
+                       b.nombre AS bodega_origen,
+                       (r.id IS NOT NULL) AS revertida
+                FROM bodega_inventario.solicitudes_detalle sd
+                INNER JOIN bodega_inventario.solicitudes s ON s.id = sd.id_solicitud
+                INNER JOIN bodega_inventario.productos p ON p.id = sd.id_producto
+                INNER JOIN bodega_inventario.bodegas b ON b.id = s.id_bodega
+                LEFT JOIN dbintranet.usuarios u ON u.idUsuarios = s.id_usuario
+                LEFT JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = u.idDatosPersonales
+                LEFT JOIN bodega_inventario.reversas r ON r.id_solicitud_detalle = sd.id
+                WHERE s.id_bodega = ? AND sd.correlativo_inicial_asignado IS NOT NULL";
+            $params = [$idBodega];
+
+            if ($desde) {
+                $sql .= " AND sd.fecha_gestion >= ?";
+                $params[] = $desde . ' 00:00:00';
+            }
+            if ($hasta) {
+                $sql .= " AND sd.fecha_gestion <= ?";
+                $params[] = $hasta . ' 23:59:59';
+            }
+            $sql .= " ORDER BY sd.fecha_gestion DESC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $consumos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($consumos)) {
+                return $this->res->info('No hay consumos de correlativos registrados en el rango indicado', null, ['consumos' => []]);
+            }
+
+            return $this->res->ok('Consumos de correlativos obtenidos', ['consumos' => $consumos]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerConsumosCorrelativos: " . $e->getMessage());
+            return $this->res->fail('Error al obtener consumos de correlativos', $e);
+        }
+    }
+    /**
+     * GET: bodega_inventario/obtenerTrazabilidadCorrelativo?contexto=area|agencia&id_producto=&numero=
+     * Historial completo de UN número de correlativo específico (10.5):
+     * a qué lote pertenece, si ya se entregó, a quién, cuándo, y si esa
+     * entrega fue revertida.
+     */
+    public function obtenerTrazabilidadCorrelativo(): array
+    {
+        try {
+            $this->_inicializarBodegaHelper();
+            $contexto = trim($_GET['contexto'] ?? 'area');
+            if (!in_array($contexto, ['area', 'agencia'], true)) {
+                return $this->res->fail('El campo contexto es requerido y debe ser "area" o "agencia"');
+            }
+            $idBodega = (int)$this->bodegaHelper->obtenerBodegaPorContexto($contexto);
+            if (!$idBodega) {
+                return $this->res->fail('El usuario en sesión no posee una bodega asignada bajo su cargo');
+            }
+
+            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT);
+            $numero     = filter_input(INPUT_GET, 'numero', FILTER_VALIDATE_INT);
+            if (!$idProducto || !$numero) {
+                return $this->res->fail('Los campos id_producto y numero son requeridos');
+            }
+
+            return $this->_trazabilidadCorrelativo($idBodega, $idProducto, $numero);
+        } catch (Exception $e) {
+            error_log("Error en obtenerTrazabilidadCorrelativo: " . $e->getMessage());
+            return $this->res->fail('Error al obtener la trazabilidad del correlativo', $e);
+        }
+    }
+
+    /** Cuerpo compartido entre la version de encargado y la global de administrador */
+    private function _trazabilidadCorrelativo(int $idBodega, int $idProducto, int $numero): array
+    {
+        $stmtLote = $this->connect->prepare(
+            "SELECT lc.id, lc.serie, lc.resolucion, lc.correlativo_inicial, lc.correlativo_final,
+                lc.correlativo_siguiente, lc.created_at AS fecha_alta
+         FROM bodega_inventario.lotes_correlativo lc
+         WHERE lc.id_bodega = ? AND lc.id_producto = ?
+           AND ? BETWEEN lc.correlativo_inicial AND lc.correlativo_final
+         LIMIT 1"
+        );
+        $stmtLote->execute([$idBodega, $idProducto, $numero]);
+        $lote = $stmtLote->fetch(PDO::FETCH_ASSOC);
+
+        if (!$lote) {
+            return $this->res->info("El correlativo #{$numero} no pertenece a ningún lote registrado en esta bodega para ese producto", null, ['lote' => null, 'entrega' => null]);
+        }
+
+        $stmtEntrega = $this->connect->prepare(
+            "SELECT sd.id AS id_detalle, s.id AS id_solicitud, sd.fecha_gestion,
+                s.id_usuario AS id_receptor, dp.nombres AS receptor,
+                r.id AS id_reversa, r.motivo AS motivo_reversa, r.created_at AS fecha_reversa
+         FROM bodega_inventario.solicitudes_detalle sd
+         INNER JOIN bodega_inventario.solicitudes s ON s.id = sd.id_solicitud
+         LEFT JOIN dbintranet.usuarios u ON u.idUsuarios = s.id_usuario
+         LEFT JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = u.idDatosPersonales
+         LEFT JOIN bodega_inventario.reversas r ON r.id_solicitud_detalle = sd.id
+         WHERE (? BETWEEN sd.correlativo_inicial_asignado AND sd.correlativo_final_asignado)
+            OR (? BETWEEN sd.correlativo_inicial_asignado_2 AND sd.correlativo_final_asignado_2)
+         LIMIT 1"
+        );
+        $stmtEntrega->execute([$numero, $numero]);
+        $entrega = $stmtEntrega->fetch(PDO::FETCH_ASSOC);
+
+        return $this->res->ok('Trazabilidad obtenida', [
+            'numero'  => $numero,
+            'lote'    => $lote,
+            'estado'  => $entrega ? ($entrega['id_reversa'] ? 'Entregado (revertido)' : 'Entregado') : 'Disponible',
+            'entrega' => $entrega ?: null,
+        ]);
+    }
+
+    // para el administrador de bodegas:
+
+    /**
+     * GET: bodega_inventario/obtenerExistenciasCorrelativosGlobal?id_bodega=&id_agencia=&id_producto=
+     * Igual que 10.3 pero sin restringirse a "mi bodega" -- para el Administrador
+     * de Bodegas, con filtros libres por bodega, agencia o producto.
+     */
+    public function obtenerExistenciasCorrelativosGlobal(): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $idBodega   = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+            $idAgencia  = filter_input(INPUT_GET, 'id_agencia', FILTER_VALIDATE_INT) ?: null;
+            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT lc.id, lc.id_bodega, b.nombre AS bodega, b.id_agencia,
+                       lc.id_producto, p.nombre AS producto,
+                       lc.serie, lc.resolucion, lc.fecha_resolucion,
+                       lc.correlativo_inicial, lc.correlativo_final, lc.correlativo_siguiente,
+                       lc.cantidad_disponible, lc.precio_unitario, lc.created_at AS fecha_alta
+                FROM bodega_inventario.lotes_correlativo lc
+                INNER JOIN bodega_inventario.productos p ON p.id = lc.id_producto
+                INNER JOIN bodega_inventario.bodegas b ON b.id = lc.id_bodega
+                WHERE lc.cantidad_disponible > 0";
+            $params = [];
+
+            if ($idBodega)   { $sql .= " AND lc.id_bodega = ?";   $params[] = $idBodega; }
+            if ($idAgencia)  { $sql .= " AND b.id_agencia = ?";   $params[] = $idAgencia; }
+            if ($idProducto) { $sql .= " AND lc.id_producto = ?"; $params[] = $idProducto; }
+            $sql .= " ORDER BY b.nombre, p.nombre, lc.correlativo_inicial";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $existencias = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($existencias)) {
+                return $this->res->info('No hay existencias de correlativos con los filtros aplicados', null, ['existencias' => []]);
+            }
+
+            return $this->res->ok('Existencias de correlativos obtenidas', ['existencias' => $existencias]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerExistenciasCorrelativosGlobal: " . $e->getMessage());
+            return $this->res->fail('Error al obtener existencias de correlativos', $e);
+        }
+    }
+    /**
+     * GET: bodega_inventario/obtenerConsumosCorrelativosGlobal?id_bodega=&id_agencia=&id_producto=&desde=&hasta=
+     * Igual que 10.4 pero global, para el Administrador de Bodegas.
+     */
+    public function obtenerConsumosCorrelativosGlobal(): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $idBodega   = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+            $idAgencia  = filter_input(INPUT_GET, 'id_agencia', FILTER_VALIDATE_INT) ?: null;
+            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT) ?: null;
+            $desde      = filter_input(INPUT_GET, 'desde', FILTER_SANITIZE_SPECIAL_CHARS) ?: null;
+            $hasta      = filter_input(INPUT_GET, 'hasta', FILTER_SANITIZE_SPECIAL_CHARS) ?: null;
+
+            $sql = "SELECT sd.id AS id_detalle, s.id AS id_solicitud, p.id AS id_producto, p.nombre AS producto,
+                       sd.correlativo_inicial_asignado, sd.correlativo_final_asignado,
+                       sd.correlativo_inicial_asignado_2, sd.correlativo_final_asignado_2,
+                       sd.cantidad_entregada, sd.fecha_gestion,
+                       s.id_usuario AS id_receptor, dp.nombres AS receptor,
+                       b.id AS id_bodega, b.nombre AS bodega_origen, b.id_agencia,
+                       (r.id IS NOT NULL) AS revertida
+                FROM bodega_inventario.solicitudes_detalle sd
+                INNER JOIN bodega_inventario.solicitudes s ON s.id = sd.id_solicitud
+                INNER JOIN bodega_inventario.productos p ON p.id = sd.id_producto
+                INNER JOIN bodega_inventario.bodegas b ON b.id = s.id_bodega
+                LEFT JOIN dbintranet.usuarios u ON u.idUsuarios = s.id_usuario
+                LEFT JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = u.idDatosPersonales
+                LEFT JOIN bodega_inventario.reversas r ON r.id_solicitud_detalle = sd.id
+                WHERE sd.correlativo_inicial_asignado IS NOT NULL";
+            $params = [];
+
+            if ($idBodega)   { $sql .= " AND s.id_bodega = ?";   $params[] = $idBodega; }
+            if ($idAgencia)  { $sql .= " AND b.id_agencia = ?";  $params[] = $idAgencia; }
+            if ($idProducto) { $sql .= " AND sd.id_producto = ?"; $params[] = $idProducto; }
+            if ($desde)      { $sql .= " AND sd.fecha_gestion >= ?"; $params[] = $desde . ' 00:00:00'; }
+            if ($hasta)      { $sql .= " AND sd.fecha_gestion <= ?"; $params[] = $hasta . ' 23:59:59'; }
+            $sql .= " ORDER BY sd.fecha_gestion DESC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $consumos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($consumos)) {
+                return $this->res->info('No hay consumos de correlativos con los filtros aplicados', null, ['consumos' => []]);
+            }
+
+            return $this->res->ok('Consumos de correlativos obtenidos', ['consumos' => $consumos]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerConsumosCorrelativosGlobal: " . $e->getMessage());
+            return $this->res->fail('Error al obtener consumos de correlativos', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerTrazabilidadCorrelativoGlobal?id_bodega=&id_producto=&numero=
+     * Igual que 10.5 pero el Administrador de Bodegas indica explícitamente
+     * la bodega (no depende de "mi bodega").
+     */
+    public function obtenerTrazabilidadCorrelativoGlobal(): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $idBodega   = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT);
+            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT);
+            $numero     = filter_input(INPUT_GET, 'numero', FILTER_VALIDATE_INT);
+
+            if (!$idBodega || !$idProducto || !$numero) {
+                return $this->res->fail('Los campos id_bodega, id_producto y numero son requeridos');
+            }
+
+            // Mismo cuerpo que obtenerTrazabilidadCorrelativo() a partir de aqui --
+            // se puede extraer a un metodo privado compartido _trazabilidadCorrelativo($idBodega,$idProducto,$numero)
+            // para no duplicar las 2 consultas; te lo dejo armado si prefieres esa version.
+            return $this->_trazabilidadCorrelativo($idBodega, $idProducto, $numero);
+        } catch (Exception $e) {
+            error_log("Error en obtenerTrazabilidadCorrelativoGlobal: " . $e->getMessage());
+            return $this->res->fail('Error al obtener la trazabilidad del correlativo', $e);
+        }
+    }
+
+    /**
+     * Resuelve el rango de fechas para los reportes de cierre: si viene id_cierre,
+     * usa su fecha_corte como límite superior y la del cierre anterior como
+     * límite inferior (exclusivo, para no duplicar el movimiento exacto del corte
+     * anterior). Si en cambio vienen desde/hasta, usa ese rango libre (inclusivo).
+     * Devuelve ['desde' => ?string, 'hasta' => string, 'exclusivoDesde' => bool] o null si hay error.
+     */
+    private function _resolverRangoReporte(): ?array
+    {
+        $idCierre = filter_input(INPUT_GET, 'id_cierre', FILTER_VALIDATE_INT) ?: null;
+        $desde    = filter_input(INPUT_GET, 'desde', FILTER_SANITIZE_SPECIAL_CHARS) ?: null;
+        $hasta    = filter_input(INPUT_GET, 'hasta', FILTER_SANITIZE_SPECIAL_CHARS) ?: null;
+
+        if ($idCierre) {
+            $stmt = $this->connect->prepare("SELECT fecha_corte FROM bodega_inventario.cierres_mensuales WHERE id = ?");
+            $stmt->execute([$idCierre]);
+            $fechaCorte = $stmt->fetchColumn();
+            if (!$fechaCorte) {
+                return null;
+            }
+
+            $stmtAnterior = $this->connect->prepare(
+                "SELECT fecha_corte FROM bodega_inventario.cierres_mensuales
+             WHERE id != ? AND fecha_corte < ? ORDER BY fecha_corte DESC LIMIT 1"
+            );
+            $stmtAnterior->execute([$idCierre, $fechaCorte]);
+            $fechaAnterior = $stmtAnterior->fetchColumn() ?: null;
+
+            return ['desde' => $fechaAnterior, 'hasta' => $fechaCorte, 'exclusivoDesde' => true];
+        }
+
+        if ($desde && $hasta) {
+            return ['desde' => $desde . ' 00:00:00', 'hasta' => $hasta . ' 23:59:59', 'exclusivoDesde' => false];
+        }
+
+        return null;
+    }
+
+    public function obtenerReporteExistenciasValorizadas(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar reportes de cierre. Se requiere rol de Contabilidad.');
+            }
+
+            $idCierre = filter_input(INPUT_GET, 'id_cierre', FILTER_VALIDATE_INT);
+            if (!$idCierre) {
+                return $this->res->fail('El campo id_cierre es requerido (este reporte es siempre puntual a un cierre, no admite rango de fechas)');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT sc.id_bodega, b.nombre AS bodega, sc.id_producto, p.nombre AS producto,
+                       sc.id_unidad, u.abreviatura, sc.saldo_final, sc.precio_unitario_cierre,
+                       ROUND(sc.saldo_final * COALESCE(sc.precio_unitario_cierre, 0), 2) AS valor_total
+                FROM bodega_inventario.saldos_cierre_bodega sc
+                INNER JOIN bodega_inventario.bodegas b ON b.id = sc.id_bodega
+                INNER JOIN bodega_inventario.productos p ON p.id = sc.id_producto
+                INNER JOIN bodega_inventario.unidades_medida u ON u.id = sc.id_unidad
+                WHERE sc.id_cierre = ?";
+            $params = [$idCierre];
+
+            if ($idBodega) {
+                $sql .= " AND sc.id_bodega = ?";
+                $params[] = $idBodega;
+            }
+            $sql .= " ORDER BY b.nombre, p.nombre";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $filas = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($filas)) {
+                return $this->res->info('No hay datos de existencias valorizadas con los filtros indicados', null, ['existencias' => [], 'valor_total_general' => 0]);
+            }
+
+            return $this->res->ok('Reporte de existencias valorizadas obtenido', [
+                'existencias' => $filas,
+                'valor_total_general' => round(array_sum(array_column($filas, 'valor_total')), 2),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteExistenciasValorizadas: " . $e->getMessage());
+            return $this->res->fail('Error al obtener el reporte de existencias valorizadas', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerReporteAltasPeriodo?id_cierre=|desde=&hasta=&id_bodega=
+     * Reporte 9.4: detalle de cada entrada de mercancia entre el cierre
+     * anterior y este (altas por compra, directas, reversas). No incluye
+     * traslados, esos van en obtenerReporteTrasladosPeriodo.
+     */
+    public function obtenerReporteAltasPeriodo(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar reportes de cierre. Se requiere rol de Contabilidad.');
+            }
+
+            $rango = $this->_resolverRangoReporte();
+            if ($rango === null) {
+                return $this->res->fail('Indique id_cierre, o un rango desde/hasta (formato AAAA-MM-DD)');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT ms.id, ms.id_bodega, b.nombre AS bodega, ms.id_producto, p.nombre AS producto,
+                       ms.cantidad, ms.id_unidad, u.abreviatura, ms.precio_unitario,
+                       ROUND(ms.cantidad * COALESCE(ms.precio_unitario, 0), 2) AS subtotal,
+                       tm.nombre AS tipo_movimiento,
+                       ms.entidad_origen, ms.id_entidad_origen, ms.created_at
+                FROM bodega_inventario.movimientos_stock ms
+                INNER JOIN bodega_inventario.bodegas b ON b.id = ms.id_bodega
+                INNER JOIN bodega_inventario.productos p ON p.id = ms.id_producto
+                INNER JOIN bodega_inventario.unidades_medida u ON u.id = ms.id_unidad
+                INNER JOIN bodega_inventario.tipos_movimiento tm ON tm.id = ms.id_tipo_movimiento
+                WHERE ms.id_tipo_movimiento IN (1, 3, 4)
+                  AND ms.created_at <= ?";
+            $params = [$rango['hasta']];
+
+            if ($rango['desde']) {
+                $sql .= $rango['exclusivoDesde'] ? " AND ms.created_at > ?" : " AND ms.created_at >= ?";
+                $params[] = $rango['desde'];
+            }
+            if ($idBodega) {
+                $sql .= " AND ms.id_bodega = ?";
+                $params[] = $idBodega;
+            }
+            $sql .= " ORDER BY ms.created_at ASC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $altas = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($altas)) {
+                return $this->res->info('No hay altas registradas con los filtros indicados', null, ['altas' => [], 'total_movimientos' => 0, 'monto_total' => 0]);
+            }
+
+            return $this->res->ok('Reporte de altas del período obtenido', [
+                'altas' => $altas,
+                'total_movimientos' => count($altas),
+                'monto_total' => round(array_sum(array_column($altas, 'subtotal')), 2),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteAltasPeriodo: " . $e->getMessage());
+            return $this->res->fail('Error al obtener el reporte de altas del período', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerReporteConsumosPeriodo?id_cierre=|desde=&hasta=&id_bodega=
+     * Reporte 9.4: detalle de cada salida (entregas y entregas directas)
+     * entre el cierre anterior y este. No incluye traslados.
+     */
+    public function obtenerReporteConsumosPeriodo(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar reportes de cierre. Se requiere rol de Contabilidad.');
+            }
+
+            $rango = $this->_resolverRangoReporte();
+            if ($rango === null) {
+                return $this->res->fail('Indique id_cierre, o un rango desde/hasta (formato AAAA-MM-DD)');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT ms.id, ms.id_bodega, b.nombre AS bodega, ms.id_producto, p.nombre AS producto,
+                       ms.cantidad, ms.id_unidad, u.abreviatura, ms.precio_unitario,
+                       ROUND(ms.cantidad * COALESCE(ms.precio_unitario, 0), 2) AS subtotal,
+                       tm.nombre AS tipo_movimiento,
+                       ms.entidad_origen, ms.id_entidad_origen, ms.created_at
+                FROM bodega_inventario.movimientos_stock ms
+                INNER JOIN bodega_inventario.bodegas b ON b.id = ms.id_bodega
+                INNER JOIN bodega_inventario.productos p ON p.id = ms.id_producto
+                INNER JOIN bodega_inventario.unidades_medida u ON u.id = ms.id_unidad
+                INNER JOIN bodega_inventario.tipos_movimiento tm ON tm.id = ms.id_tipo_movimiento
+                WHERE ms.id_tipo_movimiento IN (5, 7)
+                  AND ms.created_at <= ?";
+            $params = [$rango['hasta']];
+
+            if ($rango['desde']) {
+                $sql .= $rango['exclusivoDesde'] ? " AND ms.created_at > ?" : " AND ms.created_at >= ?";
+                $params[] = $rango['desde'];
+            }
+            if ($idBodega) {
+                $sql .= " AND ms.id_bodega = ?";
+                $params[] = $idBodega;
+            }
+            $sql .= " ORDER BY ms.created_at ASC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $consumos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($consumos)) {
+                return $this->res->info('No hay consumos registrados con los filtros indicados', null, ['consumos' => [], 'total_movimientos' => 0, 'monto_total' => 0]);
+            }
+
+            return $this->res->ok('Reporte de consumos del período obtenido', [
+                'consumos' => $consumos,
+                'total_movimientos' => count($consumos),
+                'monto_total' => round(array_sum(array_column($consumos, 'subtotal')), 2),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteConsumosPeriodo: " . $e->getMessage());
+            return $this->res->fail('Error al obtener el reporte de consumos del período', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerReporteTrasladosPeriodo?id_cierre=|desde=&hasta=&id_bodega=
+     * Reporte 9.4 (complementario): traslados COMPLETADOS (Ingresados) en el
+     * período, separado de altas/consumos para auditarlo de forma independiente.
+     * id_bodega filtra si esa bodega fue origen o destino.
+     */
+    public function obtenerReporteTrasladosPeriodo(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar reportes de cierre. Se requiere rol de Contabilidad.');
+            }
+
+            $rango = $this->_resolverRangoReporte();
+            if ($rango === null) {
+                return $this->res->fail('Indique id_cierre, o un rango desde/hasta (formato AAAA-MM-DD)');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT t.id, t.id_bodega_origen, bo.nombre AS bodega_origen,
+                       t.id_bodega_destino, bd.nombre AS bodega_destino,
+                       t.id_estado, et.nombre AS estado,
+                       t.created_at AS fecha_creacion, t.fecha_gestion,
+                       td.id_producto, p.nombre AS producto, td.cantidad, td.id_unidad, u.abreviatura,
+                       td.precio_unitario,
+                       ROUND(td.cantidad * COALESCE(td.precio_unitario, 0), 2) AS subtotal
+                FROM bodega_inventario.traslados t
+                INNER JOIN bodega_inventario.bodegas bo ON bo.id = t.id_bodega_origen
+                INNER JOIN bodega_inventario.bodegas bd ON bd.id = t.id_bodega_destino
+                INNER JOIN bodega_inventario.estados_traslado et ON et.id = t.id_estado
+                INNER JOIN bodega_inventario.traslados_detalle td ON td.id_traslado = t.id
+                INNER JOIN bodega_inventario.productos p ON p.id = td.id_producto
+                INNER JOIN bodega_inventario.unidades_medida u ON u.id = td.id_unidad
+                WHERE t.id_estado = 4
+                  AND t.fecha_gestion <= ?";
+            $params = [$rango['hasta']];
+
+            if ($rango['desde']) {
+                $sql .= $rango['exclusivoDesde'] ? " AND t.fecha_gestion > ?" : " AND t.fecha_gestion >= ?";
+                $params[] = $rango['desde'];
+            }
+            if ($idBodega) {
+                $sql .= " AND (t.id_bodega_origen = ? OR t.id_bodega_destino = ?)";
+                $params[] = $idBodega;
+                $params[] = $idBodega;
+            }
+            $sql .= " ORDER BY t.fecha_gestion ASC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $traslados = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($traslados)) {
+                return $this->res->info('No hay traslados completados con los filtros indicados', null, ['traslados' => [], 'total_movimientos' => 0, 'monto_total' => 0]);
+            }
+
+            return $this->res->ok('Reporte de traslados del período obtenido', [
+                'traslados' => $traslados,
+                'total_movimientos' => count($traslados),
+                'monto_total' => round(array_sum(array_column($traslados, 'subtotal')), 2),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteTrasladosPeriodo: " . $e->getMessage());
+            return $this->res->fail('Error al obtener el reporte de traslados del período', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/listarCierresDisponibles
+     * Lista todos los cierres mensuales ya ejecutados, para que el front
+     * arme un select en vez de pedirle al usuario que adivine el id_cierre.
+     */
+    public function listarCierresDisponibles(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar los cierres. Se requiere rol de Contabilidad.');
+            }
+
+            $stmt = $this->connect->query(
+                "SELECT cm.id, cm.fecha_corte, cm.fecha_ejecucion, cm.modulos_bloqueados,
+                    dp.nombres AS ejecutado_por
+             FROM bodega_inventario.cierres_mensuales cm
+             LEFT JOIN dbintranet.usuarios u ON u.idUsuarios = cm.id_usuario_ejecutor
+             LEFT JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = u.idDatosPersonales
+             ORDER BY cm.fecha_corte DESC"
+            );
+            $cierres = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($cierres)) {
+                return $this->res->info('Todavía no se ha ejecutado ningún cierre mensual', null, ['cierres' => []]);
+            }
+
+            return $this->res->ok('Cierres disponibles obtenidos', ['cierres' => $cierres]);
+        } catch (Exception $e) {
+            error_log("Error en listarCierresDisponibles: " . $e->getMessage());
+            return $this->res->fail('Error al listar los cierres disponibles', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerExistenciasValorizadasActuales?id_bodega=
+     * Foto EN VIVO del valor del inventario actual (no depende de ningun
+     * cierre). Util para auditoria del dia a dia; para conciliar un periodo
+     * ya cerrado usar obtenerReporteExistenciasValorizadas con id_cierre.
+     */
+    public function obtenerExistenciasValorizadasActuales(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Contabilidad.');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+
+            // Precio promedio ponderado ACTUAL, resuelto segun el tipo de producto
+            // (correlativo=1 no tiene id_unidad por lote; expiracion=2 y normal=3 si)
+            $sql = "SELECT s.id_bodega, b.nombre AS bodega, s.id_producto, p.nombre AS producto,
+                       s.id_unidad, u.abreviatura, s.cantidad_total, s.cantidad_reservada, s.cantidad_disponible,
+                       CASE p.id_tipo
+                           WHEN 1 THEN (
+                               SELECT SUM(lc.cantidad_disponible * lc.precio_unitario) / NULLIF(SUM(lc.cantidad_disponible), 0)
+                               FROM bodega_inventario.lotes_correlativo lc
+                               WHERE lc.id_bodega = s.id_bodega AND lc.id_producto = s.id_producto
+                                 AND lc.cantidad_disponible > 0
+                           )
+                           WHEN 2 THEN (
+                               SELECT SUM(le.cantidad_disponible * le.precio_unitario) / NULLIF(SUM(le.cantidad_disponible), 0)
+                               FROM bodega_inventario.lotes_expiracion le
+                               WHERE le.id_bodega = s.id_bodega AND le.id_producto = s.id_producto
+                                 AND le.id_unidad = s.id_unidad AND le.cantidad_disponible > 0
+                           )
+                           ELSE (
+                               SELECT SUM(ln.cantidad_disponible * ln.precio_unitario) / NULLIF(SUM(ln.cantidad_disponible), 0)
+                               FROM bodega_inventario.lotes_normal ln
+                               WHERE ln.id_bodega = s.id_bodega AND ln.id_producto = s.id_producto
+                                 AND ln.id_unidad = s.id_unidad AND ln.cantidad_disponible > 0
+                           )
+                       END AS precio_promedio
+                FROM bodega_inventario.stock s
+                INNER JOIN bodega_inventario.bodegas b ON b.id = s.id_bodega
+                INNER JOIN bodega_inventario.productos p ON p.id = s.id_producto
+                INNER JOIN bodega_inventario.unidades_medida u ON u.id = s.id_unidad
+                WHERE s.cantidad_total > 0";
+            $params = [];
+
+            if ($idBodega) {
+                $sql .= " AND s.id_bodega = ?";
+                $params[] = $idBodega;
+            }
+            $sql .= " ORDER BY b.nombre, p.nombre";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $existencias = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            // El valor_total se calcula en PHP (mas simple que anidarlo tambien en SQL)
+            foreach ($existencias as &$e) {
+                $precio = $e['precio_promedio'] !== null ? (float)$e['precio_promedio'] : 0;
+                $e['valor_total'] = round((float)$e['cantidad_total'] * $precio, 2);
+            }
+            unset($e);
+
+            if (empty($existencias)) {
+                return $this->res->info('No hay existencias actuales con los filtros indicados', null, ['existencias' => [], 'valor_total_general' => 0]);
+            }
+
+            return $this->res->ok('Existencias valorizadas actuales obtenidas', [
+                'existencias' => $existencias,
+                'valor_total_general' => round(array_sum(array_column($existencias, 'valor_total')), 2),
+                'fecha_consulta' => date('Y-m-d H:i:s'),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerExistenciasValorizadasActuales: " . $e->getMessage());
+            return $this->res->fail('Error al obtener las existencias valorizadas actuales', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerExistenciasValorizadasActualesDetalle?id_bodega=&id_producto=
+     * Version "detalle por lote" de la valorizacion en vivo (sin promediar):
+     * cada lote individual con su precio real, para auditar de donde sale
+     * cada monto -- util para detectar un ingreso mal capturado.
+     */
+    public function obtenerExistenciasValorizadasActualesDetalle(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Contabilidad.');
+            }
+
+            $idBodega   = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT) ?: null;
+
+            $filtroBodega   = $idBodega   ? " AND l.id_bodega = ?"   : "";
+            $filtroProducto = $idProducto ? " AND l.id_producto = ?" : "";
+            $paramsBase     = array_filter([$idBodega, $idProducto], fn($v) => $v !== null);
+
+            // --- Normal ---
+            $sqlNormal = "SELECT l.id AS id_lote, 'Normal' AS tipo_producto,
+                             l.id_bodega, b.nombre AS bodega, l.id_producto, p.nombre AS producto,
+                             l.id_unidad, u.abreviatura,
+                             l.cantidad_disponible, l.precio_unitario,
+                             ROUND(l.cantidad_disponible * COALESCE(l.precio_unitario, 0), 2) AS valor_total,
+                             l.fecha_ingreso AS fecha_referencia,
+                             NULL AS serie, NULL AS resolucion, NULL AS correlativo_inicial, NULL AS correlativo_final
+                      FROM bodega_inventario.lotes_normal l
+                      INNER JOIN bodega_inventario.bodegas b ON b.id = l.id_bodega
+                      INNER JOIN bodega_inventario.productos p ON p.id = l.id_producto
+                      INNER JOIN bodega_inventario.unidades_medida u ON u.id = l.id_unidad
+                      WHERE l.cantidad_disponible > 0{$filtroBodega}{$filtroProducto}";
+
+            // --- Expiracion ---
+            $sqlExpiracion = "SELECT l.id AS id_lote, 'Expiracion' AS tipo_producto,
+                             l.id_bodega, b.nombre AS bodega, l.id_producto, p.nombre AS producto,
+                             l.id_unidad, u.abreviatura,
+                             l.cantidad_disponible, l.precio_unitario,
+                             ROUND(l.cantidad_disponible * COALESCE(l.precio_unitario, 0), 2) AS valor_total,
+                             l.fecha_expiracion AS fecha_referencia,
+                             NULL AS serie, NULL AS resolucion, NULL AS correlativo_inicial, NULL AS correlativo_final
+                      FROM bodega_inventario.lotes_expiracion l
+                      INNER JOIN bodega_inventario.bodegas b ON b.id = l.id_bodega
+                      INNER JOIN bodega_inventario.productos p ON p.id = l.id_producto
+                      INNER JOIN bodega_inventario.unidades_medida u ON u.id = l.id_unidad
+                      WHERE l.cantidad_disponible > 0{$filtroBodega}{$filtroProducto}";
+
+            // --- Correlativo (sin id_unidad/abreviatura) ---
+            $sqlCorrelativo = "SELECT l.id AS id_lote, 'Correlativo' AS tipo_producto,
+                             l.id_bodega, b.nombre AS bodega, l.id_producto, p.nombre AS producto,
+                             NULL AS id_unidad, NULL AS abreviatura,
+                             l.cantidad_disponible, l.precio_unitario,
+                             ROUND(l.cantidad_disponible * COALESCE(l.precio_unitario, 0), 2) AS valor_total,
+                             l.created_at AS fecha_referencia,
+                             l.serie, l.resolucion, l.correlativo_inicial, l.correlativo_final
+                      FROM bodega_inventario.lotes_correlativo l
+                      INNER JOIN bodega_inventario.bodegas b ON b.id = l.id_bodega
+                      INNER JOIN bodega_inventario.productos p ON p.id = l.id_producto
+                      WHERE l.cantidad_disponible > 0{$filtroBodega}{$filtroProducto}";
+
+            $lotes = [];
+            foreach ([$sqlNormal, $sqlExpiracion, $sqlCorrelativo] as $sql) {
+                $stmt = $this->connect->prepare($sql);
+                $stmt->execute($paramsBase);
+                $lotes = array_merge($lotes, $stmt->fetchAll(PDO::FETCH_ASSOC));
+            }
+
+            if (empty($lotes)) {
+                return $this->res->info('No hay lotes con existencia con los filtros indicados', null, ['lotes' => [], 'valor_total_general' => 0]);
+            }
+
+            // Orden final: bodega, producto, fecha
+            usort($lotes, fn($a, $b) =>
+                [$a['bodega'], $a['producto'], $a['fecha_referencia']] <=> [$b['bodega'], $b['producto'], $b['fecha_referencia']]
+            );
+
+            return $this->res->ok('Detalle de existencias valorizadas obtenido', [
+                'lotes' => $lotes,
+                'valor_total_general' => round(array_sum(array_column($lotes, 'valor_total')), 2),
+                'fecha_consulta' => date('Y-m-d H:i:s'),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerExistenciasValorizadasActualesDetalle: " . $e->getMessage());
+            return $this->res->fail('Error al obtener el detalle de existencias valorizadas', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerReporteExistenciasValorizadasDetalle?id_cierre=&id_bodega=&id_producto=
+     * Version "detalle por lote" del reporte de existencias valorizadas de un
+     * cierre especifico -- para auditar exactamente de que lote sale cada monto.
+     * Solo disponible para cierres ejecutados DESPUES de activar este snapshot
+     * (los cierres anteriores no tendran filas aqui).
+     */
+    public function obtenerReporteExistenciasValorizadasDetalle(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar reportes de cierre. Se requiere rol de Contabilidad.');
+            }
+
+            $idCierre = filter_input(INPUT_GET, 'id_cierre', FILTER_VALIDATE_INT);
+            if (!$idCierre) {
+                return $this->res->fail('El campo id_cierre es requerido');
+            }
+
+            $idBodega   = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT scl.id, scl.tipo_lote, scl.id_lote_origen,
+                       scl.id_bodega, b.nombre AS bodega, scl.id_producto, p.nombre AS producto,
+                       scl.id_unidad, u.abreviatura,
+                       scl.cantidad_disponible, scl.precio_unitario,
+                       ROUND(scl.cantidad_disponible * COALESCE(scl.precio_unitario, 0), 2) AS valor_total,
+                       scl.fecha_referencia, scl.serie, scl.resolucion,
+                       scl.correlativo_inicial, scl.correlativo_final
+                FROM bodega_inventario.saldos_cierre_lote scl
+                INNER JOIN bodega_inventario.bodegas b ON b.id = scl.id_bodega
+                INNER JOIN bodega_inventario.productos p ON p.id = scl.id_producto
+                LEFT JOIN bodega_inventario.unidades_medida u ON u.id = scl.id_unidad
+                WHERE scl.id_cierre = ?";
+            $params = [$idCierre];
+
+            if ($idBodega)   { $sql .= " AND scl.id_bodega = ?";   $params[] = $idBodega; }
+            if ($idProducto) { $sql .= " AND scl.id_producto = ?"; $params[] = $idProducto; }
+            $sql .= " ORDER BY b.nombre, p.nombre, scl.fecha_referencia";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $lotes = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($lotes)) {
+                return $this->res->info('No hay detalle de lotes para este cierre (puede ser anterior a la activación de este reporte)', null, ['lotes' => [], 'valor_total_general' => 0]);
+            }
+
+            return $this->res->ok('Detalle de existencias valorizadas del cierre obtenido', [
+                'lotes' => $lotes,
+                'valor_total_general' => round(array_sum(array_column($lotes, 'valor_total')), 2),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteExistenciasValorizadasDetalle: " . $e->getMessage());
+            return $this->res->fail('Error al obtener el detalle de existencias valorizadas del cierre', $e);
+        }
     }
 }
 // FIN DE inventarioApiClass

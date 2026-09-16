@@ -428,16 +428,15 @@ final class CompraRepository
         $porPagina = min(50, max(1, $porPagina));
         $offset    = ($pagina - 1) * $porPagina;
 
-        // LEFT JOIN (no INNER): un usuario dado de baja en dbintranet no debe
-        // ocultar la compra — en ese caso el nombre queda NULL y el front cae
-        // de vuelta al id crudo (ver COALESCE más abajo).
         $sqlBase = "FROM bodega_inventario.compras c
-            INNER JOIN bodega_inventario.bodegas b ON b.id = c.id_bodega
-            LEFT JOIN dbintranet.usuarios us ON us.idUsuarios = c.id_usuario_solicitante
-            LEFT JOIN dbintranet.datospersonales dps ON dps.idDatosPersonales = us.idDatosPersonales
-            LEFT JOIN dbintranet.usuarios ug ON ug.idUsuarios = c.id_usuario_gestor
-            LEFT JOIN dbintranet.datospersonales dpg ON dpg.idDatosPersonales = ug.idDatosPersonales
-            WHERE {$whereSql}";
+        INNER JOIN bodega_inventario.bodegas b ON b.id = c.id_bodega
+        LEFT JOIN dbintranet.usuarios us ON us.idUsuarios = c.id_usuario_solicitante
+        LEFT JOIN dbintranet.datospersonales dps ON dps.idDatosPersonales = us.idDatosPersonales
+        LEFT JOIN dbintranet.usuarios ug ON ug.idUsuarios = c.id_usuario_gestor
+        LEFT JOIN dbintranet.datospersonales dpg ON dpg.idDatosPersonales = ug.idDatosPersonales
+        LEFT JOIN dbintranet.usuarios ua ON ua.idUsuarios = c.id_usuario_admin
+        LEFT JOIN dbintranet.datospersonales dpa ON dpa.idDatosPersonales = ua.idDatosPersonales
+        WHERE {$whereSql}";
 
         $stmtCount = $this->connect->prepare("SELECT COUNT(*) AS total {$sqlBase}");
         $stmtCount->execute($params);
@@ -445,13 +444,15 @@ final class CompraRepository
 
         $stmt = $this->connect->prepare(
             "SELECT c.id, c.id_bodega, b.nombre AS bodega, c.id_tipo_origen, c.id_estado,
-                    c.id_usuario_solicitante, COALESCE(dps.nombres, c.id_usuario_solicitante) AS nombre_solicitante,
-                    c.id_usuario_gestor, COALESCE(dpg.nombres, c.id_usuario_gestor) AS nombre_gestor,
-                    c.comentario_gestor, c.fecha_gestion,
-                    c.requiere_autorizacion, c.created_at
-             {$sqlBase}
-             ORDER BY c.created_at DESC
-             LIMIT {$porPagina} OFFSET {$offset}"
+                c.id_usuario_solicitante, COALESCE(dps.nombres, c.id_usuario_solicitante) AS nombre_solicitante,
+                c.id_usuario_admin, COALESCE(dpa.nombres, c.id_usuario_admin) AS nombre_admin,
+                c.id_usuario_gestor, COALESCE(dpg.nombres, c.id_usuario_gestor) AS nombre_gestor,
+                COALESCE(dps.nombres, dpa.nombres, c.id_usuario_solicitante, c.id_usuario_admin) AS nombre_responsable,
+                c.comentario_gestor, c.fecha_gestion,
+                c.requiere_autorizacion, c.created_at
+         {$sqlBase}
+         ORDER BY c.created_at DESC
+         LIMIT {$porPagina} OFFSET {$offset}"
         );
         $stmt->execute($params);
 

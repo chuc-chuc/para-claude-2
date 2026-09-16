@@ -190,7 +190,8 @@ class LotesHelper
             $this->movimientoHelper->registrarBajaEntregaCorrelativo(
                 $idBodega, $idProducto,
                 $consumir, $idDetalle, $idReceptor,
-                $corrIni, $corrFin, $tipoMovimiento
+                $corrIni, $corrFin, $tipoMovimiento,
+                isset($lote['precio_unitario']) ? (float)$lote['precio_unitario'] : null   // <-- NUEVO
             );
 
             $this->_insertarDetalleLote($idDetalle, 'id_lote_corr', (int)$lote['id'], $consumir);
@@ -283,7 +284,10 @@ class LotesHelper
             $this->movimientoHelper->registrar(
                 $tipoMovimiento, $idBodega, $idProducto, $idUnidad,
                 $consumir, 'solicitudes_detalle', $idDetalle,
-                $idReceptor
+                $idReceptor,
+                corrInicial: null,
+                corrFinal: null,
+                precioUnitario: isset($lote['precio_unitario']) ? (float)$lote['precio_unitario'] : null
             );
 
             $this->_insertarDetalleLote($idDetalle, $campoFk, (int)$lote['id'], $consumir);

@@ -192,7 +192,11 @@ final class inventarioApiClass extends ConexionBD
         'obtenerExistenciasValorizadasActuales',
         'obtenerExistenciasValorizadasActualesDetalle',
         'obtenerReporteExistenciasValorizadasDetalle',
-
+        'obtenerReporteComprasEnTransitoPeriodo',
+        'obtenerReporteAltasPendientes',
+        'obtenerReporteTrasladosPendientes',
+        'listarComprasExtraordinariasAdmin',
+        'obtenerCompraExtraordinaria',
     ];
 
     /** @var array<string> Métodos expuestos como POST. */
@@ -225,8 +229,11 @@ final class inventarioApiClass extends ConexionBD
         'crearSolicitudCompraAgencia', 'gestionarSolicitudCompraAgencia',
         'crearSolicitudCompraArea', 'gestionarSolicitudCompraArea',
         'cancelarSolicitudCompra',
-        'procesarCompra', 'autorizarCompra', 'registrarCompra', 'cancelarCompra',
+        'procesarCompra', 'autorizarCompra',
+        'autorizarComprasMasivo', 'registrarCompra', 'cancelarCompra',
         'generarComprasTrimestrales', 'crearCompraExtraordinaria',
+        'editarCompraExtraordinaria',
+        'eliminarCompraExtraordinaria',
         'editarSolicitudCompraAgencia',
         'editarSolicitudCompraArea',
         'ajustarCantidadMesaTrabajoAgencia', 'cambiarBodegaDestinoMesaTrabajoAgencia',
@@ -8022,9 +8029,12 @@ FROM
     /**
      * POST: bodega_inventario/crearCierre
      * Ejecuta el cierre mensual: valida que no existan solicitudes Reservadas
-     * pendientes, registra el cierre, y calcula/guarda el cuadre completo
-     * (resumen por bodega/producto en saldos_cierre_bodega, y el detalle por
-     * lote en saldos_cierre_lote) arrastrando el saldo del cierre anterior.
+     * pendientes ni compras en estado Enviado sin recibir, registra el cierre,
+     * y calcula/guarda el cuadre completo:
+     *   - saldos_cierre_bodega: resumen por bodega/producto/unidad
+     *   - saldos_cierre_lote: detalle por lote individual
+     *   - cierre_compras_transito: snapshot de compras en estado Comprado
+     * arrastrando el saldo del cierre anterior.
      */
     public function crearCierre($datos): array
     {
@@ -8043,7 +8053,7 @@ FROM
                 return $this->res->fail('El campo fecha_corte es requerido y debe tener el formato AAAA-MM-DD HH:MM:SS');
             }
 
-            // Parte 1 (H3): bloqueo si existen solicitudes Reservadas sin atender
+            // Bloqueo 1: solicitudes Reservadas sin atender
             $stmtPendientes = $this->connect->prepare(
                 "SELECT COUNT(*) AS total FROM bodega_inventario.solicitudes WHERE id_estado = 1"
             );
@@ -8058,6 +8068,20 @@ FROM
                 );
             }
 
+            // Bloqueo 2: compras en estado Enviado sin recibir fisicamente
+            /*$stmtEnviadas = $this->connect->prepare(
+                "SELECT COUNT(*) AS total FROM bodega_inventario.compras WHERE id_estado = 6"
+            );
+            $stmtEnviadas->execute();
+            $totalEnviadas = (int)$stmtEnviadas->fetchColumn();
+
+            if ($totalEnviadas > 0) {
+                return $this->res->fail(
+                    "No se puede ejecutar el cierre: existen {$totalEnviadas} compra(s) en estado Enviado sin recibir físicamente. " .
+                    "Deben ingresarse (ingresarNormal/ingresarExpiracion/ingresarCorrelativo) antes de cerrar el mes."
+                );
+            }*/
+
             $this->connect->beginTransaction();
 
             // Registro del cierre
@@ -8069,7 +8093,9 @@ FROM
             $stmtInsert->execute([$fechaCorte, $this->idUsuario]);
             $nuevoId = (int)$this->connect->lastInsertId();
 
-            // Parte 3 (H3 + detalle por lote): cuadre completo por bodega/producto/unidad
+            // ---------------------------------------------------------------
+            // Parte 3: cuadre completo por bodega/producto/unidad
+            // ---------------------------------------------------------------
             $fechaCorteAnterior = $this->connect->query(
                 "SELECT fecha_corte FROM bodega_inventario.cierres_mensuales
              WHERE id != {$nuevoId} ORDER BY fecha_corte DESC LIMIT 1"
@@ -8116,24 +8142,21 @@ FROM
                 $idProducto = (int)$s['id_producto'];
                 $idUnidad   = (int)$s['id_unidad'];
 
-                // Saldo inicial = saldo_final del cierre anterior para esta combinacion (0 si es la primera vez)
                 $sqlSaldoAnterior->execute([$idBodega, $idProducto, $idUnidad]);
                 $saldoInicial = (float)($sqlSaldoAnterior->fetchColumn() ?: 0);
 
-                // Movimientos desde el cierre anterior hasta este
                 $params = $fechaCorteAnterior
                     ? [$idBodega, $idProducto, $idUnidad, $fechaCorte, $fechaCorteAnterior]
                     : [$idBodega, $idProducto, $idUnidad, $fechaCorte];
                 $sqlMovimientos->execute($params);
                 $movs = array_column($sqlMovimientos->fetchAll(PDO::FETCH_ASSOC), 'total', 'id_tipo_movimiento');
 
-                $totalAltas            = (float)($movs[1] ?? 0) + (float)($movs[4] ?? 0); // Alta por compra + Alta directa
-                $totalTrasladosEntrada = (float)($movs[2] ?? 0); // Alta por traslado
-                $totalDevoluciones     = (float)($movs[3] ?? 0); // Alta por reversa
-                $totalBajas            = (float)($movs[5] ?? 0) + (float)($movs[7] ?? 0) + (float)($movs[11] ?? 0); // Entrega + Entrega directa + Reversa de alta
-                $totalTrasladosSalida  = (float)($movs[6] ?? 0); // Baja por traslado
+                $totalAltas            = (float)($movs[1] ?? 0) + (float)($movs[4] ?? 0);
+                $totalTrasladosEntrada = (float)($movs[2] ?? 0);
+                $totalDevoluciones     = (float)($movs[3] ?? 0);
+                $totalBajas            = (float)($movs[5] ?? 0) + (float)($movs[7] ?? 0) + (float)($movs[11] ?? 0);
+                $totalTrasladosSalida  = (float)($movs[6] ?? 0);
 
-                // Tipo de producto (para saber que tabla de lotes usar; correlativo=1 no tiene id_unidad)
                 $idTipoProducto = (int)$this->connect->query(
                     "SELECT id_tipo FROM bodega_inventario.productos WHERE id = {$idProducto}"
                 )->fetchColumn();
@@ -8177,14 +8200,12 @@ FROM
                 $precioPromedio = $stmtPrecio->fetchColumn();
                 $precioPromedio = $precioPromedio !== false && $precioPromedio !== null ? round((float)$precioPromedio, 4) : null;
 
-                // Resumen: saldos_cierre_bodega
                 $sqlInsertSaldo->execute([
                     $nuevoId, $idBodega, $idProducto, $idUnidad, $saldoInicial,
                     $totalAltas, $totalTrasladosEntrada, $totalDevoluciones,
                     $totalBajas, $totalTrasladosSalida, $precioPromedio,
                 ]);
 
-                // Detalle: saldos_cierre_lote (una fila por cada lote activo)
                 $lotesDetalle = $stmtLotesDetalle->fetchAll(PDO::FETCH_ASSOC);
                 foreach ($lotesDetalle as $ld) {
                     $sqlInsertLote->execute([
@@ -8203,6 +8224,35 @@ FROM
                         $ld['correlativo_final'] ?? null,
                     ]);
                 }
+            }
+
+            // ---------------------------------------------------------------
+            // Parte 4: snapshot de compras en transito (solo Comprado)
+            // ---------------------------------------------------------------
+            $stmtCompraTransito = $this->connect->query(
+                "SELECT c.id AS id_compra, c.id_bodega, c.id_estado,
+                    SUM(cd.cantidad_solicitada * cd.precio_unitario) AS valor_comprometido
+             FROM bodega_inventario.compras c
+             INNER JOIN bodega_inventario.compras_detalle cd ON cd.id_compra = c.id
+             WHERE c.id_estado = 5
+               AND cd.precio_unitario IS NOT NULL
+             GROUP BY c.id, c.id_bodega, c.id_estado"
+            );
+            $comprasTransito = $stmtCompraTransito->fetchAll(PDO::FETCH_ASSOC);
+
+            $sqlInsertTransito = $this->connect->prepare(
+                "INSERT INTO bodega_inventario.cierre_compras_transito
+                (id_cierre, id_compra, id_bodega, id_estado, valor_comprometido)
+             VALUES (?, ?, ?, ?, ?)"
+            );
+            foreach ($comprasTransito as $ct) {
+                $sqlInsertTransito->execute([
+                    $nuevoId,
+                    (int)$ct['id_compra'],
+                    (int)$ct['id_bodega'],
+                    (int)$ct['id_estado'],
+                    round((float)$ct['valor_comprometido'], 2),
+                ]);
             }
 
             $this->connect->commit();
@@ -10196,8 +10246,9 @@ FROM
             if ($idCompra < 1 || $autoriza === null) {
                 return $this->res->fail('Campos requeridos: id_compra y autoriza (true|false) son mandatorios');
             }
-            if ($comentario === '') {
-                return $this->res->fail('El comentario es obligatorio para autorizar o rechazar la compra');
+            // Antes exigía comentario siempre; ahora solo al rechazar.
+            if ($comentario === '' && !$autoriza) {
+                return $this->res->fail('El comentario es obligatorio para rechazar la compra');
             }
             if (!RolCompraHelper::usuarioTieneRol($this->puesto, [RolCompraHelper::PUESTO_GERENCIA_FINANCIERO])) {
                 return $this->res->fail('Solo Gerencia/Financiero puede autorizar o rechazar esta compra');
@@ -10216,6 +10267,62 @@ FROM
             if ($this->connect->inTransaction()) $this->connect->rollBack();
             error_log("Error en autorizarCompra: " . $e->getMessage());
             return $this->res->fail($e->getMessage() ?: 'Error crítico al autorizar la compra', $e);
+        }
+    }
+
+    /**
+     * POST: bodega_inventario/autorizarComprasMasivo
+     * Body: { ids: number[], autoriza: bool, comentario?: string }
+     *
+     * Todo-o-nada: una sola transacción para todo el lote. Si cualquier
+     * compra falla (p. ej. ya no está en estado autorizable), se revierte
+     * el lote completo y no se aplica ningún cambio.
+     */
+    public function autorizarComprasMasivo($datos): array
+    {
+        try {
+            $this->_inicializarCompras();
+            if (empty($this->idUsuario)) {
+                return $this->res->fail('Acceso denegado: No se localizó una sesión de usuario activa en el servidor');
+            }
+
+            $datos      = $this->limpiarDatos($datos);
+            $ids        = array_values(array_unique(array_map('intval', (array)($datos->ids ?? []))));
+            $autoriza   = filter_var($datos->autoriza ?? null, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+            $comentario = trim($datos->comentario ?? '');
+
+            if (empty($ids)) {
+                return $this->res->fail('Debe seleccionar al menos una compra');
+            }
+            if ($autoriza === null) {
+                return $this->res->fail('El campo autoriza (true|false) es mandatorio');
+            }
+            // Mismo criterio que la vía unitaria: comentario opcional al autorizar, obligatorio al rechazar.
+            if ($comentario === '' && !$autoriza) {
+                return $this->res->fail('El comentario es obligatorio para rechazar las compras seleccionadas');
+            }
+            if (!RolCompraHelper::usuarioTieneRol($this->puesto, [RolCompraHelper::PUESTO_GERENCIA_FINANCIERO])) {
+                return $this->res->fail('Solo Gerencia/Financiero puede autorizar o rechazar estas compras');
+            }
+
+            $this->connect->beginTransaction();
+            foreach ($ids as $idCompra) {
+                $this->compraService->autorizar($idCompra, $autoriza, $this->idUsuario, $comentario);
+            }
+            $this->connect->commit();
+
+            $mensaje = $autoriza
+                ? 'Se autorizaron ' . count($ids) . ' compra(s) correctamente'
+                : 'Se rechazaron ' . count($ids) . ' compra(s) correctamente';
+
+            return $this->res->ok($mensaje, ['ids' => $ids]);
+        } catch (Exception $e) {
+            if ($this->connect->inTransaction()) $this->connect->rollBack();
+            error_log("Error en autorizarComprasMasivo: " . $e->getMessage());
+            return $this->res->fail(
+                $e->getMessage() ?: 'Error crítico al procesar el lote. No se aplicó ningún cambio — puede reintentar.',
+                $e
+            );
         }
     }
 
@@ -10382,13 +10489,14 @@ FROM
             }
 
             $this->connect->beginTransaction();
-            $idCompra = $this->compraExtraordinariaService->crearOrdenAgencia($idBodega, $this->idUsuario, $this->puesto, $lineas);
+            $idsCompras = $this->compraExtraordinariaService->crearOrdenAgencia($idBodega, $this->idUsuario, $this->puesto, $lineas);
             $this->connect->commit();
 
-            return $this->res->ok(
-                'La compra extraordinaria fue creada y quedó a la espera de autorización de Gerencia/Financiero',
-                ['id_compra' => $idCompra]
-            );
+            $mensaje = count($idsCompras) > 1
+                ? 'Se crearon ' . count($idsCompras) . ' compras extraordinarias y quedaron a la espera de autorización de Gerencia/Financiero'
+                : 'La compra extraordinaria fue creada y quedó a la espera de autorización de Gerencia/Financiero';
+
+            return $this->res->ok($mensaje, ['ids_compra' => $idsCompras]);
         } catch (Exception $e) {
             if ($this->connect->inTransaction()) $this->connect->rollBack();
             error_log("Error en crearCompraExtraordinaria: " . $e->getMessage());
@@ -10412,17 +10520,125 @@ FROM
             }
 
             $this->connect->beginTransaction();
-            $idCompra = $this->compraExtraordinariaService->crearOrdenArea($this->idUsuario, $lineas);
+            $idsCompras = $this->compraExtraordinariaService->crearOrdenArea($this->idUsuario, $lineas);
             $this->connect->commit();
 
-            return $this->res->ok(
-                'La compra extraordinaria fue creada y ya está lista en su mesa de trabajo',
-                ['id_compra' => $idCompra]
-            );
+            $mensaje = count($idsCompras) > 1
+                ? 'Se crearon ' . count($idsCompras) . ' compras extraordinarias y ya están listas en su mesa de trabajo'
+                : 'La compra extraordinaria fue creada y ya está lista en su mesa de trabajo';
+
+            return $this->res->ok($mensaje, ['ids_compra' => $idsCompras]);
         } catch (Exception $e) {
             if ($this->connect->inTransaction()) $this->connect->rollBack();
             error_log("Error en crearCompraExtraordinariaArea: " . $e->getMessage());
             return $this->res->fail($e->getMessage() ?: 'Error crítico al crear la compra extraordinaria', $e);
+        }
+    }
+
+    /** GET: bodega_inventario/listarComprasExtraordinariasAdmin */
+    public function listarComprasExtraordinariasAdmin(): array
+    {
+        try {
+            $this->_inicializarCompras();
+            $pagina    = max(1, (int)($_GET['pagina'] ?? 1));
+            $porPagina = min(50, max(1, (int)($_GET['por_pagina'] ?? 20)));
+
+            $resultado = $this->compraExtraordinariaService->listarOrdenesAgencia($this->puesto, $pagina, $porPagina);
+
+            if (empty($resultado['ordenes'])) {
+                return $this->res->info('No hay compras extraordinarias registradas');
+            }
+
+            return $this->res->ok('Listado de compras extraordinarias obtenido correctamente', $resultado);
+        } catch (Exception $e) {
+            error_log("Error en listarComprasExtraordinariasAdmin: " . $e->getMessage());
+            return $this->res->fail($e->getMessage() ?: 'Error al obtener el listado de compras extraordinarias', $e);
+        }
+    }
+
+    /** POST: bodega_inventario/editarCompraExtraordinaria — ahora edita UNA sola línea/producto */
+    public function editarCompraExtraordinaria($datos): array
+    {
+        try {
+            $this->_inicializarCompras();
+            if (empty($this->idUsuario)) {
+                return $this->res->fail('Acceso denegado: No se localizó una sesión de usuario activa en el servidor');
+            }
+
+            $datos    = $this->limpiarDatos($datos);
+            $idCompra = (int)($datos->id_compra ?? 0);
+
+            if ($idCompra < 1) {
+                return $this->res->fail('El campo id_compra es requerido');
+            }
+
+            $linea = [
+                'id_producto'         => (int)($datos->id_producto ?? 0),
+                'id_unidad'           => (int)($datos->id_unidad ?? 0),
+                'cantidad'            => (float)($datos->cantidad ?? 0),
+                'serie'               => $datos->serie ?? null,
+                'resolucion'          => $datos->resolucion ?? null,
+                'fecha_resolucion'    => $datos->fecha_resolucion ?? null,
+                'correlativo_inicial' => isset($datos->correlativo_inicial) ? (int)$datos->correlativo_inicial : null,
+                'correlativo_final'   => isset($datos->correlativo_final) ? (int)$datos->correlativo_final : null,
+            ];
+
+            $this->connect->beginTransaction();
+            $this->compraExtraordinariaService->editarOrdenAgencia($idCompra, $this->puesto, $this->idUsuario, $linea);
+            $this->connect->commit();
+
+            return $this->res->ok('La compra extraordinaria fue actualizada correctamente');
+        } catch (Exception $e) {
+            if ($this->connect->inTransaction()) $this->connect->rollBack();
+            error_log("Error en editarCompraExtraordinaria: " . $e->getMessage());
+            return $this->res->fail($e->getMessage() ?: 'Error al editar la compra extraordinaria', $e);
+        }
+    }
+
+    /** POST: bodega_inventario/eliminarCompraExtraordinaria */
+    public function eliminarCompraExtraordinaria($datos): array
+    {
+        try {
+            $this->_inicializarCompras();
+            if (empty($this->idUsuario)) {
+                return $this->res->fail('Acceso denegado: No se localizó una sesión de usuario activa en el servidor');
+            }
+
+            $datos    = $this->limpiarDatos($datos);
+            $idCompra = (int)($datos->id_compra ?? 0);
+
+            if ($idCompra < 1) {
+                return $this->res->fail('El campo id_compra es requerido');
+            }
+
+            $this->connect->beginTransaction();
+            $this->compraExtraordinariaService->eliminarOrdenAgencia($idCompra, $this->puesto);
+            $this->connect->commit();
+
+            return $this->res->ok('La compra extraordinaria fue eliminada correctamente');
+        } catch (Exception $e) {
+            if ($this->connect->inTransaction()) $this->connect->rollBack();
+            error_log("Error en eliminarCompraExtraordinaria: " . $e->getMessage());
+            return $this->res->fail($e->getMessage() ?: 'Error al eliminar la compra extraordinaria', $e);
+        }
+    }
+
+    /** GET: bodega_inventario/obtenerCompraExtraordinaria?id= — para precargar el modal de edición */
+    public function obtenerCompraExtraordinaria(): array
+    {
+        try {
+            $this->_inicializarCompras();
+            $idCompra = (int)($_GET['id'] ?? 0);
+            if ($idCompra < 1) {
+                return $this->res->fail('El parámetro id es requerido');
+            }
+
+            $compra = $this->compraExtraordinariaService->obtenerDetalleAgencia($idCompra, $this->puesto);
+
+            return $this->res->ok('Compra obtenida correctamente', ['compra' => $compra]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerCompraExtraordinaria: " . $e->getMessage());
+            return $this->res->fail($e->getMessage() ?: 'Error al obtener la compra', $e);
         }
     }
 
@@ -11768,9 +11984,6 @@ FROM
             if ($idProducto < 1 || $idUnidad < 1 || $cantidad <= 0) {
                 return $this->res->fail('Debe indicar producto, unidad y una cantidad mayor a 0');
             }
-            if (mb_strlen($motivo) < 10) {
-                return $this->res->fail('El motivo de la entrega debe tener al menos 10 caracteres');
-            }
 
             $idBodega = (int)$this->bodegaHelper->obtenerBodegaPorContexto($contexto);
             if (!$idBodega) {
@@ -12590,22 +12803,39 @@ FROM
                 return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Contabilidad.');
             }
 
-            $stmt = $this->connect->query(
-                "SELECT b.id AS id_bodega, b.nombre AS bodega,
-                    ec.nombre AS estado,
-                    COUNT(DISTINCT c.id) AS total_compras,
-                    SUM(cd.cantidad_solicitada * cd.precio_unitario) AS valor_comprometido
-             FROM bodega_inventario.compras c
-             INNER JOIN bodega_inventario.bodegas b ON b.id = c.id_bodega
-             INNER JOIN bodega_inventario.estados_compra_v2 ec ON ec.id = c.id_estado
-             INNER JOIN bodega_inventario.compras_detalle cd ON cd.id_compra = c.id
-             WHERE c.id_estado IN (5, 6) -- 5 = Comprado, 6 = Enviado (aún no Registrado)
-               AND cd.precio_unitario IS NOT NULL
-             GROUP BY b.id, b.nombre, ec.nombre
-             ORDER BY b.nombre, ec.nombre"
-            );
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
 
-            return $this->res->ok('Valor en tránsito calculado', $stmt->fetchAll(PDO::FETCH_ASSOC));
+            $sql = "SELECT b.id AS id_bodega, b.nombre AS bodega,
+                       ec.nombre AS estado,
+                       COUNT(DISTINCT c.id) AS total_compras,
+                       SUM(cd.cantidad_solicitada * cd.precio_unitario) AS valor_comprometido
+                FROM bodega_inventario.compras c
+                INNER JOIN bodega_inventario.bodegas b ON b.id = c.id_bodega
+                INNER JOIN bodega_inventario.estados_compra_v2 ec ON ec.id = c.id_estado
+                INNER JOIN bodega_inventario.compras_detalle cd ON cd.id_compra = c.id
+                WHERE c.id_estado IN (5)
+                  AND cd.precio_unitario IS NOT NULL";
+            $params = [];
+
+            if ($idBodega) {
+                $sql .= " AND b.id = ?";
+                $params[] = $idBodega;
+            }
+            $sql .= " GROUP BY b.id, b.nombre, ec.nombre ORDER BY b.nombre, ec.nombre";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $filas = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($filas)) {
+                return $this->res->info('No hay compras en tránsito con los filtros indicados', null, ['compras' => [], 'valor_total_general' => 0]);
+            }
+
+            return $this->res->ok('Valor en tránsito calculado', [
+                'compras' => $filas,
+                'valor_total_general' => round(array_sum(array_column($filas, 'valor_comprometido')), 2),
+                'fecha_consulta' => date('Y-m-d H:i:s'),
+            ]);
         } catch (Exception $e) {
             error_log("Error en obtenerComprasEnTransito: " . $e->getMessage());
             return $this->res->fail('Error al calcular el valor en tránsito', $e);
@@ -13620,7 +13850,7 @@ FROM
     }
 
     /**
-     * GET: bodega_inventario/obtenerExistenciasValorizadasActuales?id_bodega=
+     * GET: bodega_inventario/obtenerExistenciasValorizadasActuales?id_bodega=&id_categoria=&id_tipo=
      * Foto EN VIVO del valor del inventario actual (no depende de ningun
      * cierre). Util para auditoria del dia a dia; para conciliar un periodo
      * ya cerrado usar obtenerReporteExistenciasValorizadas con id_cierre.
@@ -13632,11 +13862,13 @@ FROM
                 return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Contabilidad.');
             }
 
-            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+            $idBodega    = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+            $idCategoria = filter_input(INPUT_GET, 'id_categoria', FILTER_VALIDATE_INT) ?: null;
+            $idTipo      = filter_input(INPUT_GET, 'id_tipo', FILTER_VALIDATE_INT) ?: null;
 
-            // Precio promedio ponderado ACTUAL, resuelto segun el tipo de producto
-            // (correlativo=1 no tiene id_unidad por lote; expiracion=2 y normal=3 si)
-            $sql = "SELECT s.id_bodega, b.nombre AS bodega, s.id_producto, p.nombre AS producto,
+            $sql = "SELECT s.id_bodega, b.nombre AS bodega,
+                       s.id_producto, p.nombre AS producto, p.id_tipo,
+                       p.id_categoria, c.nombre AS categoria,
                        s.id_unidad, u.abreviatura, s.cantidad_total, s.cantidad_reservada, s.cantidad_disponible,
                        CASE p.id_tipo
                            WHEN 1 THEN (
@@ -13661,21 +13893,20 @@ FROM
                 FROM bodega_inventario.stock s
                 INNER JOIN bodega_inventario.bodegas b ON b.id = s.id_bodega
                 INNER JOIN bodega_inventario.productos p ON p.id = s.id_producto
+                INNER JOIN bodega_inventario.categorias_producto c ON c.id = p.id_categoria
                 INNER JOIN bodega_inventario.unidades_medida u ON u.id = s.id_unidad
                 WHERE s.cantidad_total > 0";
             $params = [];
 
-            if ($idBodega) {
-                $sql .= " AND s.id_bodega = ?";
-                $params[] = $idBodega;
-            }
+            if ($idBodega)    { $sql .= " AND s.id_bodega = ?";    $params[] = $idBodega; }
+            if ($idCategoria) { $sql .= " AND p.id_categoria = ?"; $params[] = $idCategoria; }
+            if ($idTipo)      { $sql .= " AND p.id_tipo = ?";      $params[] = $idTipo; }
             $sql .= " ORDER BY b.nombre, p.nombre";
 
             $stmt = $this->connect->prepare($sql);
             $stmt->execute($params);
             $existencias = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-            // El valor_total se calcula en PHP (mas simple que anidarlo tambien en SQL)
             foreach ($existencias as &$e) {
                 $precio = $e['precio_promedio'] !== null ? (float)$e['precio_promedio'] : 0;
                 $e['valor_total'] = round((float)$e['cantidad_total'] * $precio, 2);
@@ -13698,7 +13929,7 @@ FROM
     }
 
     /**
-     * GET: bodega_inventario/obtenerExistenciasValorizadasActualesDetalle?id_bodega=&id_producto=
+     * GET: bodega_inventario/obtenerExistenciasValorizadasActualesDetalle?id_bodega=&id_categoria=&id_producto=
      * Version "detalle por lote" de la valorizacion en vivo (sin promediar):
      * cada lote individual con su precio real, para auditar de donde sale
      * cada monto -- util para detectar un ingreso mal capturado.
@@ -13710,16 +13941,19 @@ FROM
                 return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Contabilidad.');
             }
 
-            $idBodega   = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
-            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT) ?: null;
+            $idBodega    = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+            $idCategoria = filter_input(INPUT_GET, 'id_categoria', FILTER_VALIDATE_INT) ?: null;
+            $idProducto  = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT) ?: null;
 
-            $filtroBodega   = $idBodega   ? " AND l.id_bodega = ?"   : "";
-            $filtroProducto = $idProducto ? " AND l.id_producto = ?" : "";
-            $paramsBase     = array_filter([$idBodega, $idProducto], fn($v) => $v !== null);
+            $filtros = "";
+            $paramsBase = [];
+            if ($idBodega)    { $filtros .= " AND l.id_bodega = ?";    $paramsBase[] = $idBodega; }
+            if ($idCategoria) { $filtros .= " AND p.id_categoria = ?"; $paramsBase[] = $idCategoria; }
+            if ($idProducto)  { $filtros .= " AND l.id_producto = ?";  $paramsBase[] = $idProducto; }
 
-            // --- Normal ---
             $sqlNormal = "SELECT l.id AS id_lote, 'Normal' AS tipo_producto,
-                             l.id_bodega, b.nombre AS bodega, l.id_producto, p.nombre AS producto,
+                             l.id_bodega, b.nombre AS bodega,
+                             l.id_producto, p.nombre AS producto, p.id_categoria, c.nombre AS categoria,
                              l.id_unidad, u.abreviatura,
                              l.cantidad_disponible, l.precio_unitario,
                              ROUND(l.cantidad_disponible * COALESCE(l.precio_unitario, 0), 2) AS valor_total,
@@ -13728,12 +13962,13 @@ FROM
                       FROM bodega_inventario.lotes_normal l
                       INNER JOIN bodega_inventario.bodegas b ON b.id = l.id_bodega
                       INNER JOIN bodega_inventario.productos p ON p.id = l.id_producto
+                      INNER JOIN bodega_inventario.categorias_producto c ON c.id = p.id_categoria
                       INNER JOIN bodega_inventario.unidades_medida u ON u.id = l.id_unidad
-                      WHERE l.cantidad_disponible > 0{$filtroBodega}{$filtroProducto}";
+                      WHERE l.cantidad_disponible > 0{$filtros}";
 
-            // --- Expiracion ---
             $sqlExpiracion = "SELECT l.id AS id_lote, 'Expiracion' AS tipo_producto,
-                             l.id_bodega, b.nombre AS bodega, l.id_producto, p.nombre AS producto,
+                             l.id_bodega, b.nombre AS bodega,
+                             l.id_producto, p.nombre AS producto, p.id_categoria, c.nombre AS categoria,
                              l.id_unidad, u.abreviatura,
                              l.cantidad_disponible, l.precio_unitario,
                              ROUND(l.cantidad_disponible * COALESCE(l.precio_unitario, 0), 2) AS valor_total,
@@ -13742,12 +13977,13 @@ FROM
                       FROM bodega_inventario.lotes_expiracion l
                       INNER JOIN bodega_inventario.bodegas b ON b.id = l.id_bodega
                       INNER JOIN bodega_inventario.productos p ON p.id = l.id_producto
+                      INNER JOIN bodega_inventario.categorias_producto c ON c.id = p.id_categoria
                       INNER JOIN bodega_inventario.unidades_medida u ON u.id = l.id_unidad
-                      WHERE l.cantidad_disponible > 0{$filtroBodega}{$filtroProducto}";
+                      WHERE l.cantidad_disponible > 0{$filtros}";
 
-            // --- Correlativo (sin id_unidad/abreviatura) ---
             $sqlCorrelativo = "SELECT l.id AS id_lote, 'Correlativo' AS tipo_producto,
-                             l.id_bodega, b.nombre AS bodega, l.id_producto, p.nombre AS producto,
+                             l.id_bodega, b.nombre AS bodega,
+                             l.id_producto, p.nombre AS producto, p.id_categoria, c.nombre AS categoria,
                              NULL AS id_unidad, NULL AS abreviatura,
                              l.cantidad_disponible, l.precio_unitario,
                              ROUND(l.cantidad_disponible * COALESCE(l.precio_unitario, 0), 2) AS valor_total,
@@ -13756,7 +13992,8 @@ FROM
                       FROM bodega_inventario.lotes_correlativo l
                       INNER JOIN bodega_inventario.bodegas b ON b.id = l.id_bodega
                       INNER JOIN bodega_inventario.productos p ON p.id = l.id_producto
-                      WHERE l.cantidad_disponible > 0{$filtroBodega}{$filtroProducto}";
+                      INNER JOIN bodega_inventario.categorias_producto c ON c.id = p.id_categoria
+                      WHERE l.cantidad_disponible > 0{$filtros}";
 
             $lotes = [];
             foreach ([$sqlNormal, $sqlExpiracion, $sqlCorrelativo] as $sql) {
@@ -13769,7 +14006,6 @@ FROM
                 return $this->res->info('No hay lotes con existencia con los filtros indicados', null, ['lotes' => [], 'valor_total_general' => 0]);
             }
 
-            // Orden final: bodega, producto, fecha
             usort($lotes, fn($a, $b) =>
                 [$a['bodega'], $a['producto'], $a['fecha_referencia']] <=> [$b['bodega'], $b['producto'], $b['fecha_referencia']]
             );
@@ -13840,6 +14076,161 @@ FROM
         } catch (Exception $e) {
             error_log("Error en obtenerReporteExistenciasValorizadasDetalle: " . $e->getMessage());
             return $this->res->fail('Error al obtener el detalle de existencias valorizadas del cierre', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerReporteComprasEnTransitoPeriodo?id_cierre=&id_bodega=
+     * Reporte 9.4 (complementario): compras que estaban en estado Comprado o
+     * Enviado (pagadas/comprometidas, aun no recibidas fisicamente) exactamente
+     * al momento de un cierre especifico -- snapshot congelado, no cambia
+     * aunque esas compras avancen despues.
+     */
+    public function obtenerReporteComprasEnTransitoPeriodo(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar reportes de cierre. Se requiere rol de Contabilidad.');
+            }
+
+            $idCierre = filter_input(INPUT_GET, 'id_cierre', FILTER_VALIDATE_INT);
+            if (!$idCierre) {
+                return $this->res->fail('El campo id_cierre es requerido');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT cct.id_compra, cct.id_bodega, b.nombre AS bodega,
+                       cct.id_estado, ec.nombre AS estado, cct.valor_comprometido
+                FROM bodega_inventario.cierre_compras_transito cct
+                INNER JOIN bodega_inventario.bodegas b ON b.id = cct.id_bodega
+                INNER JOIN bodega_inventario.estados_compra_v2 ec ON ec.id = cct.id_estado
+                WHERE cct.id_cierre = ?";
+            $params = [$idCierre];
+
+            if ($idBodega) {
+                $sql .= " AND cct.id_bodega = ?";
+                $params[] = $idBodega;
+            }
+            $sql .= " ORDER BY b.nombre, ec.nombre";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $compras = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($compras)) {
+                return $this->res->info('No había compras en tránsito en este cierre (o es anterior a la activación de este reporte)', null, ['compras' => [], 'monto_total' => 0]);
+            }
+
+            return $this->res->ok('Reporte de compras en tránsito del cierre obtenido', [
+                'compras' => $compras,
+                'monto_total' => round(array_sum(array_column($compras, 'valor_comprometido')), 2),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteComprasEnTransitoPeriodo: " . $e->getMessage());
+            return $this->res->fail('Error al obtener el reporte de compras en tránsito del cierre', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerReporteAltasPendientes?id_bodega=
+     * Reporte de control (no depende de cierre): altas generadas que aun
+     * no se han recibido completas -- para dar seguimiento a mercancia
+     * ya comprada/enviada esperando ingreso fisico.
+     */
+    public function obtenerReporteAltasPendientes(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Contabilidad.');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT a.id, a.id_bodega_destino AS id_bodega, b.nombre AS bodega,
+                       a.id_producto, p.nombre AS producto, a.id_unidad, u.abreviatura,
+                       a.cantidad_enviada, a.cantidad_ingresada,
+                       (a.cantidad_enviada - a.cantidad_ingresada) AS cantidad_pendiente,
+                       a.precio_unitario,
+                       a.created_at AS fecha_alta,
+                       DATEDIFF(CURDATE(), a.created_at) AS dias_pendiente
+                FROM bodega_inventario.altas a
+                INNER JOIN bodega_inventario.bodegas b ON b.id = a.id_bodega_destino
+                INNER JOIN bodega_inventario.productos p ON p.id = a.id_producto
+                INNER JOIN bodega_inventario.unidades_medida u ON u.id = a.id_unidad
+                WHERE a.cantidad_ingresada < a.cantidad_enviada";
+            $params = [];
+
+            if ($idBodega) {
+                $sql .= " AND a.id_bodega_destino = ?";
+                $params[] = $idBodega;
+            }
+            $sql .= " ORDER BY a.created_at ASC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $altas = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($altas)) {
+                return $this->res->info('No hay altas pendientes de recepción con los filtros indicados', null, ['altas' => []]);
+            }
+
+            return $this->res->ok('Altas pendientes obtenidas', ['altas' => $altas]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteAltasPendientes: " . $e->getMessage());
+            return $this->res->fail('Error al obtener las altas pendientes', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerReporteTrasladosPendientes?id_bodega=
+     * Reporte de control (no depende de cierre): traslados en Pendiente o
+     * Aprobado (aun no Ingresados) -- mercancia "en el limbo" entre bodegas.
+     * id_bodega filtra si esa bodega es origen o destino.
+     */
+    public function obtenerReporteTrasladosPendientes(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar este reporte. Se requiere rol de Contabilidad.');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT t.id, t.id_bodega_origen, bo.nombre AS bodega_origen,
+                       t.id_bodega_destino, bd.nombre AS bodega_destino,
+                       t.id_estado, et.nombre AS estado,
+                       t.created_at AS fecha_creacion,
+                       DATEDIFF(CURDATE(), t.created_at) AS dias_pendiente,
+                       td.id_producto, p.nombre AS producto, td.cantidad
+                FROM bodega_inventario.traslados t
+                INNER JOIN bodega_inventario.bodegas bo ON bo.id = t.id_bodega_origen
+                INNER JOIN bodega_inventario.bodegas bd ON bd.id = t.id_bodega_destino
+                INNER JOIN bodega_inventario.estados_traslado et ON et.id = t.id_estado
+                INNER JOIN bodega_inventario.traslados_detalle td ON td.id_traslado = t.id
+                INNER JOIN bodega_inventario.productos p ON p.id = td.id_producto
+                WHERE t.id_estado IN (1, 2)"; // Pendiente, Aprobado
+            $params = [];
+
+            if ($idBodega) {
+                $sql .= " AND (t.id_bodega_origen = ? OR t.id_bodega_destino = ?)";
+                $params[] = $idBodega;
+                $params[] = $idBodega;
+            }
+            $sql .= " ORDER BY t.created_at ASC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $traslados = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($traslados)) {
+                return $this->res->info('No hay traslados pendientes con los filtros indicados', null, ['traslados' => []]);
+            }
+
+            return $this->res->ok('Traslados pendientes obtenidos', ['traslados' => $traslados]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteTrasladosPendientes: " . $e->getMessage());
+            return $this->res->fail('Error al obtener los traslados pendientes', $e);
         }
     }
 }

@@ -134,11 +134,12 @@ class MovimientoHelper
         int $idBodega, int $idProducto,
         float $cantidad, int $idDetalle, ?string $idReceptor,
         int $corrInicial, int $corrFinal,
-        int $tipo = 5
+        int $tipo = 5,
+        ?float $precioUnitario = null   // <-- NUEVO
     ): void {
         $this->registrar($tipo, $idBodega, $idProducto, 1,
             $cantidad, 'solicitudes_detalle', $idDetalle,
-            $idReceptor, $corrInicial, $corrFinal);
+            $idReceptor, $corrInicial, $corrFinal, $precioUnitario);   // <-- agregado al final
     }
 
     /**

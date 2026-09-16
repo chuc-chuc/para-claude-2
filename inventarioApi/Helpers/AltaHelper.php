@@ -60,64 +60,64 @@ class AltaHelper
      *
      * @param int $idAlta
      * @param int $tipoEsperado  1=Correlativo | 2=Expiración | 3=Normal
-     * @return array|null  Fila del alta con id_tipo, o null si no pasa la validación
+     * @return object|null  Fila del alta con id_tipo, o null si no pasa la validación
      */
-    public function verificarAltaEditable(int $idAlta, int $tipoEsperado): ?array
+    public function verificarAltaEditable(int $idAlta, int $tipoEsperado): ?object
     {
         $stmt = $this->connect->prepare(
             "SELECT a.id, a.id_bodega_destino, a.id_producto, a.id_unidad,
-                    a.cantidad_enviada, a.cantidad_ingresada, a.id_estado,
-                    a.precio_unitario, p.id_tipo
-             FROM   bodega_inventario.altas a
-             INNER JOIN bodega_inventario.productos p ON p.id = a.id_producto
-             WHERE  a.id = ?
-             LIMIT  1"
+                a.cantidad_enviada, a.cantidad_ingresada, a.id_estado,
+                a.precio_unitario, p.id_tipo
+         FROM   bodega_inventario.altas a
+         INNER JOIN bodega_inventario.productos p ON p.id = a.id_producto
+         WHERE  a.id = ?
+         LIMIT  1"
         );
         $stmt->execute([$idAlta]);
-        $alta = $stmt->fetch(PDO::FETCH_ASSOC);
+        $alta = $stmt->fetch(PDO::FETCH_OBJ);
 
         if (!$alta)                                   return null; // no existe
-        if ((int)$alta['id_estado'] === 3)            return null; // ya completado
-        if ((int)$alta['id_tipo']   !== $tipoEsperado) return null; // tipo incorrecto
+        if ((int)$alta->id_estado === 3)              return null; // ya completado
+        if ((int)$alta->id_tipo   !== $tipoEsperado)  return null; // tipo incorrecto
 
         return $alta;
     }
 
     // =========================================================================
-    // EDICIÓN DE ALTA
-    // =========================================================================
+// EDICIÓN DE ALTA
+// =========================================================================
 
     /**
      * Edición completa cuando cantidad_ingresada == 0.
      * Permite cambiar bodega, producto, unidad, cantidad y precio.
      *
      * @param object $datos  Payload del endpoint editarAlta
-     * @param array  $alta   Fila actual del alta
+     * @param object $alta   Fila actual del alta
      * @return array  Respuesta ok() | fail()
      */
-    public function editarAltaCompleta(object $datos, array $alta): array
+    public function editarAltaCompleta(object $datos, object $alta): array
     {
         $idBodega = isset($datos->id_bodega_destino)
             ? (int)$datos->id_bodega_destino
-            : (int)$alta['id_bodega_destino'];
+            : (int)$alta->id_bodega_destino;
 
         $idProd = isset($datos->id_producto)
             ? (int)$datos->id_producto
-            : (int)$alta['id_producto'];
+            : (int)$alta->id_producto;
 
         $idUnidad = isset($datos->id_unidad)
             ? (int)$datos->id_unidad
-            : (int)$alta['id_unidad'];
+            : (int)$alta->id_unidad;
 
         $cantidad = isset($datos->cantidad_enviada)
             ? (float)$datos->cantidad_enviada
-            : (float)$alta['cantidad_enviada'];
+            : (float)$alta->cantidad_enviada;
 
         // precio_unitario: null = limpiar; ausente = conservar
-        $precio = array_key_exists('precio_unitario', (array)$datos)
+        $precio = property_exists($datos, 'precio_unitario')
             ? (isset($datos->precio_unitario) && $datos->precio_unitario !== ''
                 ? (float)$datos->precio_unitario : null)
-            : $alta['precio_unitario'];
+            : $alta->precio_unitario;
 
         if ($cantidad <= 0) {
             return $this->res->fail('La cantidad enviada debe ser mayor a 0');
@@ -135,11 +135,11 @@ class AltaHelper
         // Validar que la unidad pertenece al producto y ambos activos
         $stmtPU = $this->connect->prepare(
             "SELECT pu.id
-             FROM   bodega_inventario.productos_unidades pu
-             INNER JOIN bodega_inventario.productos p ON p.id = pu.id_producto
-             WHERE  pu.id_producto = ? AND pu.id_unidad = ?
-               AND  pu.activo = 1 AND p.activo = 1
-             LIMIT 1"
+         FROM   bodega_inventario.productos_unidades pu
+         INNER JOIN bodega_inventario.productos p ON p.id = pu.id_producto
+         WHERE  pu.id_producto = ? AND pu.id_unidad = ?
+           AND  pu.activo = 1 AND p.activo = 1
+         LIMIT 1"
         );
         $stmtPU->execute([$idProd, $idUnidad]);
         if (!$stmtPU->fetch()) {
@@ -148,14 +148,14 @@ class AltaHelper
 
         $this->connect->prepare(
             "UPDATE bodega_inventario.altas
-             SET id_bodega_destino = ?,
-                 id_producto       = ?,
-                 id_unidad         = ?,
-                 cantidad_enviada  = ?,
-                 precio_unitario   = ?,
-                 updated_at        = NOW()
-             WHERE id = ?"
-        )->execute([$idBodega, $idProd, $idUnidad, $cantidad, $precio, (int)$alta['id']]);
+         SET id_bodega_destino = ?,
+             id_producto       = ?,
+             id_unidad         = ?,
+             cantidad_enviada  = ?,
+             precio_unitario   = ?,
+             updated_at        = NOW()
+         WHERE id = ?"
+        )->execute([$idBodega, $idProd, $idUnidad, $cantidad, $precio, (int)$alta->id]);
 
         return $this->res->ok('Alta actualizada correctamente');
     }
@@ -166,15 +166,15 @@ class AltaHelper
      * y editar precio si no hay lotes con precio ya asignado.
      *
      * @param object $datos  Payload del endpoint editarAlta
-     * @param array  $alta   Fila actual del alta
+     * @param object $alta   Fila actual del alta
      * @return array  Respuesta ok() | info() | fail()
      */
-    public function ajustarAltaParcial(object $datos, array $alta): array
+    public function ajustarAltaParcial(object $datos, object $alta): array
     {
-        $motivo  = trim($datos->motivo ?? '');
-        $idAlta  = (int)$alta['id'];
-        $ingresada = (float)$alta['cantidad_ingresada'];
-        $cambios = [];
+        $motivo    = trim($datos->motivo ?? '');
+        $idAlta    = (int)$alta->id;
+        $ingresada = (float)$alta->cantidad_ingresada;
+        $cambios   = [];
 
         // ── Ajuste de cantidad ──────────────────────────────────────────────
         if (isset($datos->cantidad_enviada)) {
@@ -196,11 +196,11 @@ class AltaHelper
 
             $cambios['cantidad_enviada'] = $nuevaCantidad;
             $cambios['id_estado']        = $nuevaCantidad <= $ingresada
-                ? 3 : (int)$alta['id_estado'];
+                ? 3 : (int)$alta->id_estado;
         }
 
         // ── Ajuste de precio ────────────────────────────────────────────────
-        if (array_key_exists('precio_unitario', (array)$datos)) {
+        if (property_exists($datos, 'precio_unitario')) {
             if ($this->tieneLotesConPrecio($idAlta)) {
                 return $this->res->fail(
                     'No se puede cambiar el precio: ya existen lotes ingresados con precio asignado'

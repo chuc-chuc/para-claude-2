@@ -126,7 +126,12 @@ class LotesHelper
 
     /**
      * Asigna correlativos a una entrega, consumiendo lotes en orden ascendente.
-     * Puede cruzar hasta 2 lotes si el primero no alcanza.
+     * Puede cruzar cualquier cantidad de lotes si el primero no alcanza — cada
+     * uno queda registrado en solicitudes_detalle_lotes con su propio rango
+     * (ver _insertarDetalleLote). Las columnas resumen de solicitudes_detalle
+     * (correlativo_inicial_asignado / _2) solo guardan los primeros 2 lotes,
+     * como atajo para el caso común — no son la fuente de verdad para revertir;
+     * esa es solicitudes_detalle_lotes (ver ReversaHelper::revertirEntregaCorrelativo).
      *
      * @param int         $idBodega
      * @param int         $idProducto
@@ -194,7 +199,7 @@ class LotesHelper
                 isset($lote['precio_unitario']) ? (float)$lote['precio_unitario'] : null   // <-- NUEVO
             );
 
-            $this->_insertarDetalleLote($idDetalle, 'id_lote_corr', (int)$lote['id'], $consumir);
+            $this->_insertarDetalleLote($idDetalle, 'id_lote_corr', (int)$lote['id'], $consumir, $corrIni, $corrFin);
 
             $lotesUsados[] = [
                 'id_lote'  => (int)$lote['id'],
@@ -209,6 +214,8 @@ class LotesHelper
         $l1 = $lotesUsados[0];
         $l2 = $lotesUsados[1] ?? null;
 
+        // Atajo de conveniencia para el caso común (1-2 lotes) — la trazabilidad
+        // completa y sin límite ya quedó en solicitudes_detalle_lotes arriba.
         $this->connect->prepare(
             "UPDATE bodega_inventario.solicitudes_detalle
          SET    correlativo_inicial_asignado   = ?,
@@ -302,18 +309,25 @@ class LotesHelper
     /**
      * Inserta una fila de trazabilidad en solicitudes_detalle_lotes.
      *
+     * $corrInicial/$corrFinal son opcionales — solo aplican a lotes
+     * correlativo (ver asignarCorrelativo). Se guardan por CADA lote
+     * tocado, sin límite, precisamente para que una entrega que cruce
+     * 3 o más lotes quede completa aquí — a diferencia de las columnas
+     * resumen de solicitudes_detalle, que solo alcanzan para 2.
+     *
      * @param int    $idDetalle  ID de solicitudes_detalle
      * @param string $campoFk    'id_lote_corr' | 'id_lote_exp' | 'id_lote_normal'
      * @param int    $idLote     ID del lote consumido
      * @param float  $cantidad
      */
     private function _insertarDetalleLote(
-        int $idDetalle, string $campoFk, int $idLote, float $cantidad
+        int $idDetalle, string $campoFk, int $idLote, float $cantidad,
+        ?int $corrInicial = null, ?int $corrFinal = null
     ): void {
         $this->connect->prepare(
             "INSERT INTO bodega_inventario.solicitudes_detalle_lotes
-                 (id_solicitud_det, {$campoFk}, cantidad)
-             VALUES (?, ?, ?)"
-        )->execute([$idDetalle, $idLote, $cantidad]);
+                 (id_solicitud_det, {$campoFk}, cantidad, correlativo_inicial, correlativo_final)
+             VALUES (?, ?, ?, ?, ?)"
+        )->execute([$idDetalle, $idLote, $cantidad, $corrInicial, $corrFinal]);
     }
 }

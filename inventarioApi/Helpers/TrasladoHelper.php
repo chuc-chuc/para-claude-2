@@ -195,6 +195,105 @@ class TrasladoHelper
     }
 
     // =========================================================================
+    // AUTO-ASIGNACIÓN Y RESERVA (Traslados Masivos — sin selección manual de lote)
+    // =========================================================================
+    //
+    // A diferencia de bloquearYReservarLoteCorrelativo/Expiracion (que exigen
+    // UN lote ya elegido por el encargado), estos métodos recorren los lotes
+    // en el mismo orden que usa el motor de entregas (LotesHelper) y REPARTEN
+    // la cantidad entre tantos lotes como haga falta — cada uno queda con su
+    // propia fila en traslados_detalle. Siguen siendo solo RESERVA
+    // (cantidad_reservada), no consumo: el consumo físico real ocurre hasta
+    // confirmarRecepcionTraslado, igual que el traslado simple.
+    //
+    // Devuelven [] (arreglo vacío) si NO alcanza sumando todos los lotes
+    // disponibles — el llamador decide qué hacer con la línea (omitirla).
+
+    /**
+     * @return array<array{id_lote:int, cantidad:int}> Vacío si no alcanza.
+     */
+    public function autoAsignarYReservarCorrelativo(int $idBodegaOrigen, int $idProducto, int $cantidad): array
+    {
+        $stmt = $this->connect->prepare(
+            "SELECT id, (cantidad_disponible - cantidad_reservada) AS libre
+             FROM   bodega_inventario.lotes_correlativo
+             WHERE  id_bodega = ? AND id_producto = ?
+               AND  (cantidad_disponible - cantidad_reservada) > 0
+             ORDER  BY correlativo_inicial ASC
+             FOR UPDATE"
+        );
+        $stmt->execute([$idBodegaOrigen, $idProducto]);
+        $lotes = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        if (array_sum(array_column($lotes, 'libre')) < $cantidad) {
+            return [];
+        }
+
+        $stmtUpd = $this->connect->prepare(
+            "UPDATE bodega_inventario.lotes_correlativo
+             SET    cantidad_reservada = cantidad_reservada + ?
+             WHERE  id = ?"
+        );
+
+        $pendiente    = $cantidad;
+        $asignaciones = [];
+
+        foreach ($lotes as $lote) {
+            if ($pendiente <= 0) break;
+
+            $tomar = min($pendiente, (int)$lote['libre']);
+            $stmtUpd->execute([$tomar, $lote['id']]);
+
+            $asignaciones[] = ['id_lote' => (int)$lote['id'], 'cantidad' => $tomar];
+            $pendiente -= $tomar;
+        }
+
+        return $asignaciones;
+    }
+
+    /**
+     * @return array<array{id_lote:int, cantidad:float}> Vacío si no alcanza.
+     */
+    public function autoAsignarYReservarExpiracion(int $idBodegaOrigen, int $idProducto, int $idUnidad, float $cantidad): array
+    {
+        $stmt = $this->connect->prepare(
+            "SELECT id, (cantidad_disponible - cantidad_reservada) AS libre
+             FROM   bodega_inventario.lotes_expiracion
+             WHERE  id_bodega = ? AND id_producto = ? AND id_unidad = ?
+               AND  (cantidad_disponible - cantidad_reservada) > 0
+             ORDER  BY fecha_expiracion ASC
+             FOR UPDATE"
+        );
+        $stmt->execute([$idBodegaOrigen, $idProducto, $idUnidad]);
+        $lotes = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        if (array_sum(array_column($lotes, 'libre')) < $cantidad) {
+            return [];
+        }
+
+        $stmtUpd = $this->connect->prepare(
+            "UPDATE bodega_inventario.lotes_expiracion
+             SET    cantidad_reservada = cantidad_reservada + ?
+             WHERE  id = ?"
+        );
+
+        $pendiente    = $cantidad;
+        $asignaciones = [];
+
+        foreach ($lotes as $lote) {
+            if ($pendiente <= 0) break;
+
+            $tomar = min($pendiente, (float)$lote['libre']);
+            $stmtUpd->execute([$tomar, $lote['id']]);
+
+            $asignaciones[] = ['id_lote' => (int)$lote['id'], 'cantidad' => $tomar];
+            $pendiente -= $tomar;
+        }
+
+        return $asignaciones;
+    }
+
+    // =========================================================================
     // CONSUMO DEFINITIVO Y CREACIÓN DEL LOTE ESPEJO EN DESTINO (confirmarRecepcion)
     // =========================================================================
 

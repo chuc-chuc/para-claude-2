@@ -15,6 +15,14 @@ use PDO;
  * FLUJO 3 — Sugerencia automática de compra por consumo del trimestre
  * recién cerrado, una compra por bodega.
  *
+ * Dos entradas a la MISMA lógica:
+ *   - Administrador (calcularSugerencias/generarOrdenes más abajo):
+ *     recorre TODAS las bodegas (Agencia + Área).
+ *   - Encargado de Agencia (calcularSugerenciaBodega/generarOrdenBodega,
+ *     ver sección dedicada): la misma regla, acotada a UNA bodega. Es un
+ *     canal adicional, no reemplaza al Administrador — ver
+ *     CompraTrimestralAgenciaService para el flujo completo de acceso.
+ *
  * Regla de cálculo (OJO: NO es un promedio):
  *   cantidad_sugerida = consumo TOTAL del trimestre objetivo - existencia actual
  *   Ej.: se consumieron 10 en el trimestre, hay 7 en existencia → se sugieren 3,
@@ -99,6 +107,7 @@ final class CompraTrimestralService
             $porBodega[$idBodega]['lineas'][] = [
                 'id_producto'       => (int) $fila->id_producto,
                 'producto'          => $fila->producto,
+                'id_tipo_producto'  => (int) $fila->id_tipo_producto,
                 'id_unidad'         => (int) $fila->id_unidad,
                 'unidad'            => $fila->unidad,
                 'abreviatura'       => $fila->abreviatura,
@@ -230,6 +239,147 @@ final class CompraTrimestralService
         ];
     }
 
+    // =========================================================================
+    // Encargado de Agencia — autoservicio, acotado a SU bodega
+    // =========================================================================
+    //
+    // Mismo cálculo y misma regla de alza que arriba (calcularSugerencias /
+    // generarOrdenes), pero para una sola bodega. NO exigen rol de
+    // Administrador — el llamador (CompraTrimestralAgenciaService) ya
+    // resolvió y validó que la bodega es la del usuario en sesión.
+    //
+    // Es un canal ADICIONAL: el Administrador conserva su vista completa
+    // (Agencia + Área) arriba, por si el encargado no genera a tiempo. El
+    // control de "ya generado" en `trimestres_generados` es compartido —
+    // quien llegue primero bloquea al otro para esa bodega y ese trimestre.
+
+    /**
+     * Preview de la sugerencia trimestral para UNA sola bodega.
+     *
+     * @return array{periodo: array{anio:int, trimestre:int, etiqueta:string}, lineas: array, ya_generado: bool}
+     */
+    public function calcularSugerenciaBodega(int $idBodega): array
+    {
+        $periodo       = $this->trimestreHelper->obtenerTrimestreObjetivo();
+        $idsMovimiento = $this->resolverIdsTipoMovimiento();
+        $yaGenerado    = $this->bodegaYaGenerada($idBodega, $periodo['anio'], $periodo['trimestre']);
+
+        $lineas = [];
+        if (!$yaGenerado) {
+            foreach ($this->calcularSugeridaPorLinea($idsMovimiento, $periodo['inicio'], $periodo['fin'], $idBodega) as $fila) {
+                $sugerida = round((float) $fila->consumo_trimestre - (float) $fila->existencia, 2);
+
+                if ($sugerida <= 0) {
+                    continue;
+                }
+
+                $lineas[] = [
+                    'id_producto'       => (int) $fila->id_producto,
+                    'producto'          => $fila->producto,
+                    'id_tipo_producto'  => (int) $fila->id_tipo_producto,
+                    'id_unidad'         => (int) $fila->id_unidad,
+                    'unidad'            => $fila->unidad,
+                    'abreviatura'       => $fila->abreviatura,
+                    'existencia'        => round((float) $fila->existencia, 2),
+                    'consumo_trimestre' => round((float) $fila->consumo_trimestre, 2),
+                    'cantidad_sugerida' => $sugerida,
+                ];
+            }
+        }
+
+        return [
+            'periodo'     => ['anio' => $periodo['anio'], 'trimestre' => $periodo['trimestre'], 'etiqueta' => $periodo['etiqueta']],
+            'lineas'      => $lineas,
+            'ya_generado' => $yaGenerado,
+        ];
+    }
+
+    /**
+     * Genera el pedido trimestral de UNA sola bodega — mismas reglas que
+     * generarOrdenes(): recalcula las sugeridas frescas contra la BD (nunca
+     * confía en lo que mandó el cliente) y, si alguna línea queda por
+     * encima de lo sugerido, la compra nace en REQUIERE_AUTORIZACION.
+     *
+     * El correlativo (correlativo_inicial/correlativo_final) es opcional
+     * aquí también — el llamador es responsable de exigirlo cuando el
+     * producto sea de control Correlativo (id_tipo_producto = 1); este
+     * método solo lo traslada tal cual a CompraService::crear().
+     *
+     * @param array<array{id_producto:int,id_unidad:int,cantidad:float,correlativo_inicial?:?int,correlativo_final?:?int}> $lineasEntrada
+     * @return array{periodo: array, id_compra:int, lineas:int, requiere_autorizacion:bool}
+     */
+    public function generarOrdenBodega(int $idBodega, string $idUsuarioSolicitante, array $lineasEntrada): array
+    {
+        if (empty($lineasEntrada)) {
+            throw new Exception('Debe indicar al menos una línea de producto para generar el pedido trimestral');
+        }
+
+        $periodo = $this->trimestreHelper->obtenerTrimestreObjetivo();
+
+        if ($this->bodegaYaGenerada($idBodega, $periodo['anio'], $periodo['trimestre'])) {
+            throw new Exception("Ya existe una orden trimestral generada para esta bodega en {$periodo['etiqueta']}");
+        }
+
+        // Recalculamos las sugeridas frescas — misma defensa que generarOrdenes().
+        $mapaSugeridas = $this->mapaSugeridasActual($periodo['inicio'], $periodo['fin'], $idBodega);
+
+        $lineas  = [];
+        $hayAlza = false;
+
+        foreach ($lineasEntrada as $l) {
+            $idProducto = (int) ($l['id_producto'] ?? 0);
+            $idUnidad   = (int) ($l['id_unidad'] ?? 0);
+            $cantidad   = round((float) ($l['cantidad'] ?? 0), 2);
+
+            // Cantidad en 0 = el encargado decidió que esta línea no hace
+            // falta, aunque el sistema la haya sugerido. Se omite, no es error.
+            if ($idProducto < 1 || $idUnidad < 1 || $cantidad <= 0) {
+                continue;
+            }
+
+            $clave    = "{$idBodega}:{$idProducto}:{$idUnidad}";
+            $sugerida = $mapaSugeridas[$clave] ?? 0.0;
+
+            if ($cantidad > $sugerida) {
+                $hayAlza = true;
+            }
+
+            $lineas[] = [
+                'id_producto'         => $idProducto,
+                'id_unidad'           => $idUnidad,
+                'cantidad'            => $cantidad,
+                'justificacion'       => "Consumo de {$periodo['etiqueta']}: {$sugerida} sugerido",
+                // Solo aplica si el producto es de control Correlativo — si
+                // no vienen, quedan NULL y se completan al recibir el lote.
+                'correlativo_inicial' => $l['correlativo_inicial'] ?? null,
+                'correlativo_final'   => $l['correlativo_final'] ?? null,
+            ];
+        }
+
+        if (empty($lineas)) {
+            throw new Exception('No se generó ninguna orden: todas las líneas quedaron en cero');
+        }
+
+        $idCompra = $this->compraService->crear(
+            idBodega: $idBodega,
+            tipoOrigen: TipoOrigenCompra::TRIMESTRAL,
+            estadoInicial: $hayAlza ? EstadoCompra::REQUIERE_AUTORIZACION : EstadoCompra::APROBADA,
+            lineas: $lineas,
+            idUsuarioSolicitante: $idUsuarioSolicitante,
+            idUsuarioAdmin: $idUsuarioSolicitante,
+            requiereAutorizacion: $hayAlza,
+        );
+
+        $this->registrarBodegaGenerada($idBodega, $periodo['anio'], $periodo['trimestre'], $idCompra);
+
+        return [
+            'periodo'               => ['anio' => $periodo['anio'], 'trimestre' => $periodo['trimestre'], 'etiqueta' => $periodo['etiqueta']],
+            'id_compra'             => $idCompra,
+            'lineas'                => count($lineas),
+            'requiere_autorizacion' => $hayAlza,
+        ];
+    }
+
     // -----------------------------------------------------------------
 
     private function exigirAdministrador(?int $idPuestoSesion): void
@@ -240,12 +390,12 @@ final class CompraTrimestralService
     }
 
     /** @return array<string,float> clave "idBodega:idProducto:idUnidad" => cantidad sugerida (nunca negativa) */
-    private function mapaSugeridasActual(string $inicio, string $fin): array
+    private function mapaSugeridasActual(string $inicio, string $fin, ?int $idBodegaFiltro = null): array
     {
         $idsMovimiento = $this->resolverIdsTipoMovimiento();
         $mapa = [];
 
-        foreach ($this->calcularSugeridaPorLinea($idsMovimiento, $inicio, $fin) as $fila) {
+        foreach ($this->calcularSugeridaPorLinea($idsMovimiento, $inicio, $fin, $idBodegaFiltro) as $fila) {
             $sugerida = round((float) $fila->consumo_trimestre - (float) $fila->existencia, 2);
             $clave    = "{$fila->id_bodega}:{$fila->id_producto}:{$fila->id_unidad}";
             $mapa[$clave] = max(0.0, $sugerida);
@@ -276,19 +426,28 @@ final class CompraTrimestralService
      * por bodega+producto+unidad, con nombres ya resueltos. `stock` puede
      * tener varias filas por combinación (una por lote) — se agrega con
      * SUM, igual que StockHelper::obtenerCantidadTotal().
+     *
+     * $idBodegaFiltro es opcional: si se indica, acota el cálculo a una
+     * sola bodega (lo usa el flujo de autoservicio del Encargado de
+     * Agencia — ver calcularSugerenciaBodega()). Sin filtro, se comporta
+     * exactamente igual que antes (todas las bodegas, para el Administrador).
+     *
+     * También trae `id_tipo_producto` (1 = Correlativo, 2 = Expiración) para
+     * que el llamador sepa qué líneas necesitan pedir correlativo.
      */
-    private function calcularSugeridaPorLinea(array $idsMovimiento, string $inicio, string $fin): array
+    private function calcularSugeridaPorLinea(array $idsMovimiento, string $inicio, string $fin, ?int $idBodegaFiltro = null): array
     {
         $placeholders = implode(',', array_fill(0, count($idsMovimiento), '?'));
+        $filtroBodega = $idBodegaFiltro !== null ? ' AND s.id_bodega = ?' : '';
 
         $stmt = $this->connect->prepare(
             "SELECT s.id_bodega, b.nombre AS nombre_bodega,
-                    s.id_producto, p.nombre AS producto,
+                    s.id_producto, p.nombre AS producto, p.id_tipo AS id_tipo_producto,
                     s.id_unidad, u.nombre AS unidad, u.abreviatura,
                     SUM(s.cantidad_total) AS existencia,
                     COALESCE(consumo.total_consumido, 0) AS consumo_trimestre
              FROM bodega_inventario.stock s
-             INNER JOIN bodega_inventario.bodegas b ON b.id = s.id_bodega AND b.activo = 1
+             INNER JOIN bodega_inventario.bodegas b ON b.id = s.id_bodega AND b.activo = 1{$filtroBodega}
              INNER JOIN bodega_inventario.productos p ON p.id = s.id_producto
              INNER JOIN bodega_inventario.unidades_medida u ON u.id = s.id_unidad
              LEFT JOIN (
@@ -305,7 +464,10 @@ final class CompraTrimestralService
              GROUP BY s.id_bodega, s.id_producto, s.id_unidad
              ORDER BY b.nombre ASC, p.nombre ASC"
         );
-        $stmt->execute(array_merge($idsMovimiento, [$inicio, $fin]));
+
+        $params = $idBodegaFiltro !== null ? [$idBodegaFiltro] : [];
+        $params = array_merge($params, $idsMovimiento, [$inicio, $fin]);
+        $stmt->execute($params);
 
         return $stmt->fetchAll(PDO::FETCH_OBJ);
     }

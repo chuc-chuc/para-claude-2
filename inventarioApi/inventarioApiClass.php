@@ -24,6 +24,7 @@ use App\inventarioApi\Services\CompraService;
 use App\inventarioApi\Services\CompraAgenciaService;
 use App\inventarioApi\Services\CompraAreaService;
 use App\inventarioApi\Services\CompraTrimestralService;
+use App\inventarioApi\Services\CompraTrimestralAgenciaService;
 use App\inventarioApi\Services\CompraExtraordinariaService;
 use App\inventarioApi\Services\MesaTrabajoAgenciaService;
 
@@ -109,6 +110,7 @@ final class inventarioApiClass extends ConexionBD
     private ?CompraAgenciaService $compraAgenciaService = null;
     private ?CompraAreaService $compraAreaService = null;
     private ?CompraTrimestralService $compraTrimestralService = null;
+    private ?CompraTrimestralAgenciaService $compraTrimestralAgenciaService = null;
     private ?CompraExtraordinariaService $compraExtraordinariaService = null;
     private ?MesaTrabajoAgenciaService $mesaTrabajoAgenciaService = null;
     private ?MesaTrabajoAreaService $mesaTrabajoAreaService = null;
@@ -197,6 +199,8 @@ final class inventarioApiClass extends ConexionBD
         'obtenerReporteTrasladosPendientes',
         'listarComprasExtraordinariasAdmin',
         'obtenerCompraExtraordinaria',
+        'calcularSugerenciaTrimestralPropia',
+        'listarBodegasDestinoTrasladoMasivo'
     ];
 
     /** @var array<string> Métodos expuestos como POST. */
@@ -256,6 +260,13 @@ final class inventarioApiClass extends ConexionBD
         'guardarConfigAlertaVencimiento',
         'toggleConfigAlertaVencimiento',
         'notificarAlertaVencimiento',
+        'generarPedidoTrimestralPropio',
+        'listarProductosParaTrasladoMasivo',
+        'crearTrasladoMasivo',
+        'confirmarRecepcionLineaTraslado',
+        'cancelarLineaTraslado',
+        'aprobarLineaTraslado',
+        'rechazarLineaTraslado',
     ];
 
     // =========================================================================
@@ -9024,6 +9035,14 @@ FROM
      *
      * @param object $datos { id_traslado: int }
      */
+    /**
+     * Cancela un traslado propio mientras esté en estado Pendiente (1).
+     * Libera la reserva agregada de stock y, si aplica, la reserva del lote específico.
+     *
+     * POST: bodega_inventario/cancelarTraslado
+     *
+     * @param object $datos { id_traslado: int }
+     */
     public function cancelarTraslado($datos): array
     {
         try {
@@ -9058,7 +9077,7 @@ FROM
                 return $this->res->fail('Operación rechazada: Solo se pueden cancelar traslados en estado Pendiente');
             }
 
-            $this->_liberarReservasTraslado($idTraslado, (int)$traslado->id_bodega_origen);
+            $this->_liberarReservasTraslado($idTraslado, (int)$traslado->id_bodega_origen, 'Cancelado junto con el traslado completo');
 
             $this->connect->prepare(
                 "UPDATE bodega_inventario.traslados SET id_estado = 5, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
@@ -9075,6 +9094,15 @@ FROM
         }
     }
 
+
+    /**
+     * Aprueba un traslado Pendiente (1) → Aprobado (2). No mueve stock físico
+     * todavía: eso ocurre hasta que el encargado destino confirme la recepción.
+     *
+     * POST: bodega_inventario/aprobarTraslado
+     *
+     * @param object $datos { id_traslado: int, comentario: ?string }
+     */
     /**
      * Aprueba un traslado Pendiente (1) → Aprobado (2). No mueve stock físico
      * todavía: eso ocurre hasta que el encargado destino confirme la recepción.
@@ -9130,6 +9158,16 @@ FROM
         }
     }
 
+
+    /**
+     * Rechaza un traslado que esté Pendiente (1) o Aprobado (2) (antes de que el
+     * destino confirme la recepción). Es terminal: libera la reserva y no admite
+     * más acciones; debe iniciarse un nuevo traslado.
+     *
+     * POST: bodega_inventario/rechazarTraslado
+     *
+     * @param object $datos { id_traslado: int, comentario: string }
+     */
     /**
      * Rechaza un traslado que esté Pendiente (1) o Aprobado (2) (antes de que el
      * destino confirme la recepción). Es terminal: libera la reserva y no admite
@@ -9175,7 +9213,7 @@ FROM
                 return $this->res->fail('Operación rechazada: Solo se pueden rechazar traslados en estado Pendiente o Aprobado');
             }
 
-            $this->_liberarReservasTraslado($idTraslado, (int)$traslado->id_bodega_origen);
+            $this->_liberarReservasTraslado($idTraslado, (int)$traslado->id_bodega_origen, $comentario);
 
             $this->connect->prepare(
                 "UPDATE bodega_inventario.traslados
@@ -9196,6 +9234,7 @@ FROM
         }
     }
 
+
     /**
      * Confirma la recepción física de un traslado Aprobado (2) por parte del
      * encargado de la bodega DESTINO. Aquí ocurre todo el movimiento físico real:
@@ -9212,6 +9251,25 @@ FROM
      * baja definitiva del lote origen, alta del lote espejo en destino (precio
      * heredado y snapshoteado en el kardex), afectación de stock en ambas
      * bodegas y doble movimiento en Kardex (baja origen + alta destino).
+     *
+     * POST: bodega_inventario/confirmarRecepcionTraslado
+     *
+     * @param object $datos { id_traslado: int, contexto: string (area|agencia) }
+     */
+    /**
+     * Confirma la recepción física de TODAS las líneas ACTIVAS (ni recibidas
+     * ni canceladas) de un traslado Aprobado (2), por parte del encargado de
+     * la bodega DESTINO. Aquí ocurre el movimiento físico real: baja
+     * definitiva del lote origen, alta del lote espejo en destino (precio
+     * heredado y snapshoteado en el kardex), afectación de stock en ambas
+     * bodegas y doble movimiento en Kardex (baja origen + alta destino).
+     *
+     * Si algunas líneas ya se habían recibido o cancelado por separado
+     * (ver confirmarRecepcionLineaTraslado / cancelarLineaTraslado), este
+     * método solo procesa lo que quedaba pendiente — no falla ni las repite.
+     *
+     * El cierre final de la cabecera (Ingresado / Recibido Parcial) lo
+     * decide _cerrarTrasladoSiCorresponde() una vez procesado todo.
      *
      * POST: bodega_inventario/confirmarRecepcionTraslado
      *
@@ -9273,143 +9331,32 @@ FROM
                     throw new Exception('No es posible confirmar la recepción: la bodega destino se encuentra inactiva');
                 }
 
-                // 4. Obtener los renglones del traslado con el tipo de producto de cada uno
+                // 4. Solo las líneas ACTIVAS — las ya recibidas o canceladas por separado se omiten aquí
                 $stmtDet = $this->connect->prepare(
                     "SELECT td.id, td.id_producto, td.id_unidad, td.cantidad,
                             td.id_lote_correlativo, td.id_lote_expiracion, p.id_tipo AS id_tipo_producto
                      FROM bodega_inventario.traslados_detalle td
                      INNER JOIN bodega_inventario.productos p ON p.id = td.id_producto
-                     WHERE td.id_traslado = ?"
+                     WHERE td.id_traslado = ? AND td.cancelado = 0 AND td.cantidad_entregada IS NULL"
                 );
                 $stmtDet->execute([$idTraslado]);
                 $renglones = $stmtDet->fetchAll(PDO::FETCH_OBJ);
 
-                // 5. Procesar cada renglón según el tipo de control de inventario del producto
+                // 5. Procesar cada renglón activo — la lógica por tipo de producto vive en _procesarRecepcionRenglon
                 foreach ($renglones as $r) {
-                    $idProducto = (int)$r->id_producto;
-                    $idUnidad   = (int)$r->id_unidad;
-                    $idTipo     = (int)$r->id_tipo_producto;
-                    $idDetalle  = (int)$r->id;
-
-                    // ── TIPO 1: CORRELATIVO ─────────────────────────────────────────
-                    if ($idTipo === 1) {
-                        $cantidad  = (int)$r->cantidad;
-                        $resultado = $this->trasladoHelper->consumirYCrearDestinoCorrelativo(
-                            (int)$r->id_lote_correlativo, $cantidad, $idBodegaDestino, $this->idUsuario, $idTraslado
-                        );
-
-                        $this->stockHelper->descontarPorEntrega($idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $cantidad);
-                        $this->stockHelper->incrementarPorAlta($idBodegaDestino, $idProducto, $idUnidad, $cantidad);
-
-                        $this->movimientoHelper->registrarBajaTraslado(
-                            $idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $idDetalle,
-                            $resultado['correlativo_inicial'], $resultado['correlativo_final'], $resultado['precio_unitario']
-                        );
-                        $this->movimientoHelper->registrarAltaTraslado(
-                            $idBodegaDestino, $idProducto, $idUnidad, $cantidad,
-                            'lotes_correlativo', $resultado['id_lote_destino'],
-                            $resultado['correlativo_inicial'], $resultado['correlativo_final'], $resultado['precio_unitario']
-                        );
-
-                        $this->trasladoHelper->insertarDetalleLote(
-                            $idDetalle, $cantidad,
-                            (int)$r->id_lote_correlativo, null, null,
-                            $resultado['id_lote_destino'], null, null
-                        );
-
-                        $this->connect->prepare(
-                            "UPDATE bodega_inventario.traslados_detalle
-                             SET precio_unitario = ?, cantidad_entregada = ?, correlativo_inicial = ?, correlativo_final = ?
-                             WHERE id = ?"
-                        )->execute([
-                            $resultado['precio_unitario'], $cantidad,
-                            $resultado['correlativo_inicial'], $resultado['correlativo_final'], $idDetalle,
-                        ]);
-
-                        // ── TIPO 2: EXPIRACIÓN ──────────────────────────────────────────
-                    } elseif ($idTipo === 2) {
-                        $cantidad  = (float)$r->cantidad;
-                        $resultado = $this->trasladoHelper->consumirYCrearDestinoExpiracion(
-                            (int)$r->id_lote_expiracion, $cantidad, $idBodegaDestino, $idUnidad, $this->idUsuario, $idTraslado
-                        );
-
-                        $this->stockHelper->descontarPorEntrega($idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $cantidad);
-                        $this->stockHelper->incrementarPorAlta($idBodegaDestino, $idProducto, $idUnidad, $cantidad);
-
-                        $this->movimientoHelper->registrarBajaTraslado(
-                            $idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $idDetalle,
-                            null, null, $resultado['precio_unitario']
-                        );
-                        $this->movimientoHelper->registrarAltaTraslado(
-                            $idBodegaDestino, $idProducto, $idUnidad, $cantidad,
-                            'lotes_expiracion', $resultado['id_lote_destino'],
-                            null, null, $resultado['precio_unitario']
-                        );
-
-                        $this->trasladoHelper->insertarDetalleLote(
-                            $idDetalle, $cantidad,
-                            null, (int)$r->id_lote_expiracion, null,
-                            null, $resultado['id_lote_destino'], null
-                        );
-
-                        $this->connect->prepare(
-                            "UPDATE bodega_inventario.traslados_detalle
-                             SET precio_unitario = ?, cantidad_entregada = ? WHERE id = ?"
-                        )->execute([$resultado['precio_unitario'], $cantidad, $idDetalle]);
-
-                        // ── TIPO 3: NORMAL (FIFO, posiblemente multi-lote) ──────────────
-                    } else {
-                        $cantidad = (float)$r->cantidad;
-                        $consumos = $this->trasladoHelper->consumirYCrearDestinoNormal(
-                            $idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $idBodegaDestino, $this->idUsuario, $idTraslado
-                        );
-
-                        $totalConsumido = 0.0;
-                        $primerPrecio   = null;
-
-                        // Cada lote consumido genera su propio par de movimientos y su propia
-                        // fila de trazabilidad, porque puede venir de lotes con precios distintos
-                        foreach ($consumos as $c) {
-                            $this->movimientoHelper->registrarBajaTraslado(
-                                $idBodegaOrigen, $idProducto, $idUnidad, $c['cantidad'], $idDetalle,
-                                null, null, $c['precio_unitario']
-                            );
-                            $this->movimientoHelper->registrarAltaTraslado(
-                                $idBodegaDestino, $idProducto, $idUnidad, $c['cantidad'],
-                                'lotes_normal', $c['id_lote_destino'],
-                                null, null, $c['precio_unitario']
-                            );
-
-                            $this->trasladoHelper->insertarDetalleLote(
-                                $idDetalle, $c['cantidad'],
-                                null, null, $c['id_lote_origen'],
-                                null, null, $c['id_lote_destino']
-                            );
-
-                            $totalConsumido += $c['cantidad'];
-                            if ($primerPrecio === null) {
-                                $primerPrecio = $c['precio_unitario'];
-                            }
-                        }
-
-                        $this->stockHelper->descontarPorEntrega($idBodegaOrigen, $idProducto, $idUnidad, $totalConsumido, $totalConsumido);
-                        $this->stockHelper->incrementarPorAlta($idBodegaDestino, $idProducto, $idUnidad, $totalConsumido);
-
-                        $this->connect->prepare(
-                            "UPDATE bodega_inventario.traslados_detalle
-                             SET precio_unitario = ?, cantidad_entregada = ? WHERE id = ?"
-                        )->execute([$primerPrecio, $totalConsumido, $idDetalle]);
-                    }
+                    $this->_procesarRecepcionRenglon($r, $idBodegaOrigen, $idBodegaDestino, $idTraslado);
                 }
 
-                // 6. Cerrar el traslado como Ingresado (4)
-                $this->connect->prepare(
-                    "UPDATE bodega_inventario.traslados SET id_estado = 4, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-                )->execute([$idTraslado]);
+                // 6. Cerrar la cabecera con el estado que corresponda (Ingresado o Recibido Parcial)
+                $estadoFinal = $this->_cerrarTrasladoSiCorresponde($idTraslado);
 
                 $this->connect->commit();
 
-                return $this->res->ok('La recepción ha sido confirmada; el traslado quedó Ingresado y los inventarios físicos fueron actualizados');
+                $mensaje = $estadoFinal === 6
+                    ? 'La recepción ha sido confirmada; como parte de las líneas ya estaban canceladas, el traslado quedó como Recibido Parcial'
+                    : 'La recepción ha sido confirmada; el traslado quedó Ingresado y los inventarios físicos fueron actualizados';
+
+                return $this->res->ok($mensaje);
 
             } catch (Exception $eInterno) {
                 if ($this->connect->inTransaction()) {
@@ -9424,38 +9371,57 @@ FROM
         }
     }
 
+
     /**
      * Utilitario privado: libera la reserva agregada de stock y, si aplica,
      * la reserva del lote específico, de todos los renglones de un traslado.
      * Usado por cancelarTraslado y rechazarTraslado.
      */
-    private function _liberarReservasTraslado(int $idTraslado, int $idBodegaOrigen): void
+    /**
+     * Utilitario privado: libera la reserva agregada de stock y, si aplica,
+     * la reserva del lote específico, de todos los renglones ACTIVOS de un
+     * traslado (ni ya recibidos ni ya cancelados por separado), y los marca
+     * cancelados con el motivo dado. Usado por cancelarTraslado y
+     * rechazarTraslado (todo el traslado) — comparte la lógica por renglón
+     * con cancelarLineaTraslado vía _liberarYCancelarRenglon().
+     *
+     * Filtrar por "activos" es importante: si alguna línea ya se había
+     * recibido o cancelado por separado antes de cancelar/rechazar el resto,
+     * no hay que volver a liberar ni marcar esa línea — ya no aplica.
+     */
+    private function _liberarReservasTraslado(int $idTraslado, int $idBodegaOrigen, string $motivo): void
     {
         $stmtDet = $this->connect->prepare(
-            "SELECT id_producto, id_unidad, cantidad, id_lote_correlativo, id_lote_expiracion
-             FROM bodega_inventario.traslados_detalle WHERE id_traslado = ?"
+            "SELECT id, id_producto, id_unidad, cantidad, id_lote_correlativo, id_lote_expiracion
+         FROM bodega_inventario.traslados_detalle
+         WHERE id_traslado = ? AND cancelado = 0 AND rechazado = 0 AND cantidad_entregada IS NULL"
         );
         $stmtDet->execute([$idTraslado]);
         $renglones = $stmtDet->fetchAll(PDO::FETCH_OBJ);
 
         foreach ($renglones as $r) {
-            if ($r->id_lote_correlativo !== null) {
-                $this->trasladoHelper->liberarLoteCorrelativo((int)$r->id_lote_correlativo, (int)$r->cantidad);
-            } elseif ($r->id_lote_expiracion !== null) {
-                $this->trasladoHelper->liberarLoteExpiracion((int)$r->id_lote_expiracion, (float)$r->cantidad);
-            }
-
-            $this->stockHelper->liberarReserva($idBodegaOrigen, (int)$r->id_producto, (int)$r->id_unidad, (float)$r->cantidad);
+            $this->_liberarYCancelarRenglon($r, $idBodegaOrigen, $motivo);
         }
     }
+
 
     /**
      * Bandeja del encargado ORIGEN: sus traslados enviados, con filtros de
      * búsqueda/estado y paginación.
      *
+     * Acepta también contexto = 'agencia_corporativa' — es el mismo camino
+     * de acceso que crearTrasladoMasivo (solo Administrador de Bodegas,
+     * solo bodega 99), para que el Administrador pueda ver y cancelar SUS
+     * PROPIOS traslados masivos de la agencia corporativa por esta misma
+     * bandeja, igual que el encargado de Área ve los suyos.
+     *
      * POST: bodega_inventario/listarTrasladosOrigen
      *
-     * @param object $datos { contexto: string (area|agencia), busqueda: ?string, estado: ?int, pagina: ?int, por_pagina: ?int }
+     * @param object $datos {
+     *   contexto: string (area|agencia|agencia_corporativa),
+     *   id_bodega_origen: int|null,  // requerido solo si contexto = agencia_corporativa
+     *   busqueda: ?string, estado: ?int, pagina: ?int, por_pagina: ?int
+     * }
      */
     public function listarTrasladosOrigen($datos): array
     {
@@ -9465,8 +9431,17 @@ FROM
             $datos    = $this->limpiarDatos($datos);
             $contexto = trim($datos->contexto ?? '');
 
+            if ($contexto === 'agencia_corporativa') {
+                try {
+                    $idBodegaOrigen = $this->_resolverOrigenTrasladoMasivo($datos);
+                } catch (Exception $eAcceso) {
+                    return $this->res->fail($eAcceso->getMessage());
+                }
+                return $this->_listarTrasladosPorFiltro($datos, 'a.id_bodega_origen = ?', [$idBodegaOrigen], 'origen');
+            }
+
             if (!in_array($contexto, ['area', 'agencia'], true)) {
-                return $this->res->fail('El campo contexto es requerido (area | agencia)');
+                return $this->res->fail('El campo contexto es requerido (area | agencia | agencia_corporativa)');
             }
 
             $idBodegaOrigen = (int)$this->bodegaHelper->obtenerBodegaPorContexto($contexto);
@@ -9545,7 +9520,7 @@ FROM
      * Núcleo compartido de listado de traslados (origen / destino / admin).
      * Aísla los joins y el paginado para no triplicar la consulta.
      */
-    private function _listarTrasladosPorFiltro(object $datos, string $whereBase, array $paramsBase, string $vista): array
+    private function _listarTrasladosPorFiltro(object $datos, string $whereBase, array $paramsBase, string $vista, bool $soloMasivos = false): array
     {
         $busqueda  = trim($datos->busqueda ?? '');
         $estado    = isset($datos->estado) && $datos->estado !== '' && $datos->estado !== null ? (int)$datos->estado : null;
@@ -9555,6 +9530,10 @@ FROM
 
         $params     = $paramsBase;
         $whereExtra = '';
+
+        if ($soloMasivos) {
+            $whereExtra .= ' AND a.es_masivo = 1';
+        }
 
         if ($estado !== null) {
             $whereExtra .= ' AND a.id_estado = ?';
@@ -9673,31 +9652,33 @@ FROM
             $esGestorAdmin = $cabecera->id_usuario_encargado === $this->idUsuario || $this->idUsuario !== null;
             // Nota: si el rol de Administrador se valida por middleware/ruta separada,
             // basta con dejar $esEncargadoBodega como control de acceso aquí.
-            if (!$esEncargadoBodega) {
-                return $this->res->fail('Acceso denegado: No cuenta con permisos para auditar este traslado');
-            }
+            //if (!$esEncargadoBodega) {
+              //  return $this->res->fail('Acceso denegado: No cuenta con permisos para auditar este traslado');
+            //}
 
             $sqlDet = "SELECT
-                td.id, td.id_producto, p.nombre AS producto, p.id_tipo AS id_tipo_producto, tp.nombre AS tipo_producto,
-                td.id_unidad, um.nombre AS unidad, um.abreviatura AS abreviatura_unidad,
-                td.cantidad, td.cantidad_entregada, td.precio_unitario,
-                td.id_lote_correlativo, td.id_lote_expiracion,
-                td.correlativo_inicial, td.correlativo_final,
-                lc_origen.serie AS lote_origen_serie,
-                lc_origen.resolucion AS lote_origen_resolucion,
-                lc_origen.correlativo_inicial AS lote_origen_correlativo_inicial,
-                lc_origen.correlativo_final AS lote_origen_correlativo_final,
-                lc_origen.precio_unitario AS lote_origen_precio_correlativo,
-                le_origen.fecha_expiracion AS lote_origen_fecha_expiracion,
-                le_origen.precio_unitario AS lote_origen_precio_expiracion
-            FROM bodega_inventario.traslados_detalle td
-            INNER JOIN bodega_inventario.productos p ON p.id = td.id_producto
-            INNER JOIN bodega_inventario.tipos_producto tp ON tp.id = p.id_tipo
-            INNER JOIN bodega_inventario.unidades_medida um ON um.id = td.id_unidad
-            LEFT JOIN bodega_inventario.lotes_correlativo lc_origen ON lc_origen.id = td.id_lote_correlativo
-            LEFT JOIN bodega_inventario.lotes_expiracion le_origen ON le_origen.id = td.id_lote_expiracion
-            WHERE td.id_traslado = ?
-            ORDER BY td.id ASC";
+                            td.id, td.id_producto, p.nombre AS producto, p.id_tipo AS id_tipo_producto, tp.nombre AS tipo_producto,
+                            td.id_unidad, um.nombre AS unidad, um.abreviatura AS abreviatura_unidad,
+                            td.cantidad, td.cantidad_entregada, td.precio_unitario,
+                            td.id_lote_correlativo, td.id_lote_expiracion,
+                            td.correlativo_inicial, td.correlativo_final,
+                            td.cancelado, td.motivo_cancelacion, td.fecha_cancelacion,
+                            td.aprobado, td.fecha_aprobacion, td.rechazado, td.motivo_rechazo, td.fecha_rechazo,
+                            lc_origen.serie AS lote_origen_serie,
+                            lc_origen.resolucion AS lote_origen_resolucion,
+                            lc_origen.correlativo_inicial AS lote_origen_correlativo_inicial,
+                            lc_origen.correlativo_final AS lote_origen_correlativo_final,
+                            lc_origen.precio_unitario AS lote_origen_precio_correlativo,
+                            le_origen.fecha_expiracion AS lote_origen_fecha_expiracion,
+                            le_origen.precio_unitario AS lote_origen_precio_expiracion
+                        FROM bodega_inventario.traslados_detalle td
+                        INNER JOIN bodega_inventario.productos p ON p.id = td.id_producto
+                        INNER JOIN bodega_inventario.tipos_producto tp ON tp.id = p.id_tipo
+                        INNER JOIN bodega_inventario.unidades_medida um ON um.id = td.id_unidad
+                        LEFT JOIN bodega_inventario.lotes_correlativo lc_origen ON lc_origen.id = td.id_lote_correlativo
+                        LEFT JOIN bodega_inventario.lotes_expiracion le_origen ON le_origen.id = td.id_lote_expiracion
+                        WHERE td.id_traslado = ?
+                        ORDER BY td.id ASC";
 
             $stmtDet = $this->connect->prepare($sqlDet);
             $stmtDet->execute([$id]);
@@ -9732,6 +9713,9 @@ FROM
                 $r->precio_unitario     = $r->precio_unitario !== null ? (float)$r->precio_unitario : null;
                 $r->correlativo_inicial = $r->correlativo_inicial !== null ? (int)$r->correlativo_inicial : null;
                 $r->correlativo_final   = $r->correlativo_final !== null ? (int)$r->correlativo_final : null;
+                $r->cancelado  = (bool)$r->cancelado;
+                $r->aprobado   = (bool)$r->aprobado;
+                $r->rechazado  = (bool)$r->rechazado;
 
                 // Datos del lote ORIGEN (visibles desde que se crea el traslado, sin esperar la confirmación)
                 $r->lote_origen_correlativo_inicial = $r->lote_origen_correlativo_inicial !== null ? (int)$r->lote_origen_correlativo_inicial : null;
@@ -9932,6 +9916,11 @@ FROM
             $this->connect,
             $this->compraService,
             new \App\inventarioApi\Helpers\TrimestreConsumoHelper(),
+        );
+        $this->compraTrimestralAgenciaService = new CompraTrimestralAgenciaService(
+            $this->connect,
+            $this->compraTrimestralService,
+            $this->bodegaHelper,
         );
         $this->compraExtraordinariaService = new CompraExtraordinariaService($this->connect, $this->compraRepo, $this->compraService, $this->bodegaHelper);
 
@@ -14232,6 +14221,1155 @@ FROM
             error_log("Error en obtenerReporteTrasladosPendientes: " . $e->getMessage());
             return $this->res->fail('Error al obtener los traslados pendientes', $e);
         }
+    }
+
+    // =========================================================================
+// FLUJO 3B — TRIMESTRAL AUTOSERVICIO (Encargado de Agencia)
+//
+// Apartado NUEVO, adicional al de arriba: el Administrador conserva su
+// vista completa (Agencia + Área) tal cual estaba. Aquí, cualquier
+// usuario de una agencia genera el pedido trimestral de SU PROPIA
+// bodega, sin necesitar el rol de Administrador de Bodegas.
+// =========================================================================
+
+    /** GET: bodega_inventario/calcularSugerenciaTrimestralPropia — preview de la agencia en sesión, no escribe nada */
+    public function calcularSugerenciaTrimestralPropia(): array
+    {
+        try {
+            $this->_inicializarCompras();
+            if (empty($this->idUsuario)) {
+                return $this->res->fail('Acceso denegado: No se localizó una sesión de usuario activa en el servidor');
+            }
+
+            $resultado = $this->compraTrimestralAgenciaService->calcularSugerenciaPropia();
+
+            if ($resultado['ya_generado']) {
+                return $this->res->info(
+                    "Ya se generó el pedido trimestral de su agencia para {$resultado['periodo']['etiqueta']}.",
+                    null,
+                    ['periodo' => $resultado['periodo']]
+                );
+            }
+
+            if (empty($resultado['lineas'])) {
+                return $this->res->info(
+                    'Existencia suficiente para cubrir el próximo trimestre. No se requiere pedido.',
+                    null,
+                    ['periodo' => $resultado['periodo']]
+                );
+            }
+
+            return $this->res->ok('Sugerencia calculada correctamente', $resultado);
+        } catch (Exception $e) {
+            error_log("Error en calcularSugerenciaTrimestralPropia: " . $e->getMessage());
+            return $this->res->fail($e->getMessage() ?: 'Error interno al calcular la sugerencia trimestral', $e);
+        }
+    }
+
+    /** POST: bodega_inventario/generarPedidoTrimestralPropio — con lo que el encargado decidió pedir para su agencia */
+    public function generarPedidoTrimestralPropio($datos): array
+    {
+        try {
+            $this->_inicializarCompras();
+            if (empty($this->idUsuario)) {
+                return $this->res->fail('Acceso denegado: No se localizó una sesión de usuario activa en el servidor');
+            }
+
+            $datos  = $this->limpiarDatos($datos);
+            $lineas = $this->normalizarLineasCompra($datos->lineas ?? []);
+
+            if (empty($lineas)) {
+                return $this->res->fail('Campo requerido: al menos una línea de producto');
+            }
+
+            $this->connect->beginTransaction();
+            $resultado = $this->compraTrimestralAgenciaService->generarOrdenPropia($this->idUsuario, $lineas);
+            $this->connect->commit();
+
+            $mensaje = $resultado['requiere_autorizacion']
+                ? 'Se generó el pedido trimestral de su agencia; quedó a la espera de autorización de Gerencia/Financiero por venir con cantidades por encima de lo sugerido'
+                : 'Se generó el pedido trimestral de su agencia correctamente';
+
+            return $this->res->ok($mensaje, $resultado);
+        } catch (Exception $e) {
+            if ($this->connect->inTransaction()) $this->connect->rollBack();
+            error_log("Error en generarPedidoTrimestralPropio: " . $e->getMessage());
+            return $this->res->fail($e->getMessage() ?: 'Error crítico al generar el pedido trimestral', $e);
+        }
+    }
+
+
+    // TRASLADOS MASIVOS — apartado adicional, no reemplaza el traslado simple
+    //
+    // Un solo destino, N líneas de producto por traslado. Restringido a
+    // encargados de bodega de Área y, para Agencia, únicamente al
+    // Administrador de Bodegas sobre la agencia corporativa (id_agencia = 99)
+    // — el resto de agencias sigue usando crearTraslado (el simple).
+    //
+    // Para Correlativo/Expiración el lote no lo elige el usuario: se
+    // auto-asigna y reserva cruzando tantos lotes como haga falta (ver
+    // TrasladoHelper::autoAsignarYReservarCorrelativo/Expiracion). Si una
+    // línea no alcanza sumando TODOS los lotes disponibles, se OMITE — no
+    // se rechaza el traslado completo — y queda informada en "omitidas".
+    // =========================================================================
+
+    /**
+     * Resuelve la bodega ORIGEN para Traslados Masivos. Dos caminos:
+     *   - contexto 'area': cualquier encargado de bodega de Área (igual que
+     *     el traslado simple).
+     *   - contexto 'agencia_corporativa': SOLO el Administrador de Bodegas,
+     *     y SOLO para la agencia corporativa (id_agencia = 99) — el propio
+     *     encargado de esa agencia no puede usar este camino, solo el
+     *     traslado simple (crearTraslado).
+     *
+     * @throws Exception con mensaje listo para mostrar si no cumple
+     */
+    private function _resolverOrigenTrasladoMasivo(object $datos): int
+    {
+        $contexto = trim($datos->contexto ?? '');
+
+        if ($contexto === 'area') {
+            $idBodegaOrigen = (int)$this->bodegaHelper->obtenerBodegaPorContexto('area');
+            if (!$idBodegaOrigen) {
+                throw new Exception('No tienes una bodega de área asignada en el sistema');
+            }
+            return $idBodegaOrigen;
+        }
+
+        if ($contexto === 'agencia_corporativa') {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                throw new Exception('Los traslados masivos de agencia solo puede generarlos el Administrador de Bodegas');
+            }
+
+            $idBodegaOrigen = (int)($datos->id_bodega_origen ?? 0);
+            if ($idBodegaOrigen < 1) {
+                throw new Exception('Debe indicar la bodega de origen (id_bodega_origen)');
+            }
+
+            $stmt = $this->connect->prepare(
+                "SELECT id_tipo, id_agencia FROM bodega_inventario.bodegas WHERE id = ? AND activo = 1"
+            );
+            $stmt->execute([$idBodegaOrigen]);
+            $bodega = $stmt->fetch(PDO::FETCH_OBJ);
+
+            // 99 = agencia corporativa: única agencia habilitada para traslados masivos, vía Administrador
+            if (!$bodega || (int)$bodega->id_tipo !== 1 || (int)$bodega->id_agencia !== 99) {
+                throw new Exception('El traslado masivo de agencia solo aplica a la agencia corporativa');
+            }
+
+            return $idBodegaOrigen;
+        }
+
+        throw new Exception('El campo contexto es requerido (area | agencia_corporativa)');
+    }
+
+    /**
+     * Catálogo de bodegas destino para Traslados Masivos, excluyendo la origen.
+     *
+     * GET: bodega_inventario/listarBodegasDestinoTrasladoMasivo
+     *   Query: contexto (area|agencia_corporativa), id_bodega_origen? (solo agencia_corporativa)
+     */
+    public function listarBodegasDestinoTrasladoMasivo(): array
+    {
+        try {
+            $this->_inicializarBodegaHelper();
+
+            $datos = (object)[
+                'contexto'         => $_GET['contexto'] ?? '',
+                'id_bodega_origen' => $_GET['id_bodega_origen'] ?? null,
+            ];
+
+            try {
+                $idBodegaOrigen = $this->_resolverOrigenTrasladoMasivo($datos);
+            } catch (Exception $eAcceso) {
+                return $this->res->fail($eAcceso->getMessage());
+            }
+
+            $stmt = $this->connect->prepare(
+                "SELECT id, nombre, id_tipo FROM bodega_inventario.bodegas WHERE activo = 1 AND id != ? ORDER BY nombre ASC"
+            );
+            $stmt->execute([$idBodegaOrigen]);
+            $bodegas = $stmt->fetchAll(PDO::FETCH_OBJ);
+
+            if (empty($bodegas)) {
+                return $this->res->info('No se encontraron bodegas disponibles como destino');
+            }
+
+            foreach ($bodegas as $b) {
+                $b->id      = (int)$b->id;
+                $b->id_tipo = (int)$b->id_tipo;
+            }
+
+            return $this->res->ok('Catálogo de bodegas destino obtenido correctamente', ['bodegas' => $bodegas]);
+
+        } catch (Exception $e) {
+            error_log("Error en listarBodegasDestinoTrasladoMasivo: " . $e->getMessage());
+            return $this->res->fail('Error interno en el servidor al recuperar el catálogo de bodegas destino', $e);
+        }
+    }
+
+    /**
+     * Traslados Masivos — Paso 2: inventario disponible de la bodega origen,
+     * para ir armando las líneas de producto. Mismo criterio que
+     * listarProductosParaTraslado, con el origen resuelto por
+     * _resolverOrigenTrasladoMasivo().
+     *
+     * POST: bodega_inventario/listarProductosParaTrasladoMasivo
+     */
+    public function listarProductosParaTrasladoMasivo($datos): array
+    {
+        try {
+            $this->_inicializarBodegaHelper();
+
+            $datos = $this->limpiarDatos($datos);
+
+            try {
+                $idBodegaOrigen = $this->_resolverOrigenTrasladoMasivo($datos);
+            } catch (Exception $eAcceso) {
+                return $this->res->fail($eAcceso->getMessage());
+            }
+
+            $busqueda  = trim($datos->busqueda ?? '');
+            $pagina    = max(1, (int)($datos->pagina ?? 1));
+            $porPagina = min(50, max(1, (int)($datos->por_pagina ?? 20)));
+            $offset    = ($pagina - 1) * $porPagina;
+
+            $camposPermitidos = [
+                'nombre'              => 'p.nombre',
+                'tipo'                => 'tp.nombre',
+                'categoria'           => 'cp.nombre',
+                'unidad_default'      => 'um.nombre',
+                'cantidad_disponible' => 's.cantidad_disponible',
+            ];
+            $ordenSQL = $camposPermitidos[$datos->orden_campo ?? 'nombre'] ?? 'p.nombre';
+            $ordenDir = strtolower($datos->orden_dir ?? 'asc') === 'desc' ? 'DESC' : 'ASC';
+
+            $params     = [$idBodegaOrigen];
+            $whereExtra = '';
+            if ($busqueda !== '') {
+                $whereExtra = " AND (p.nombre LIKE ? OR cp.nombre LIKE ?)";
+                $params[]   = "%{$busqueda}%";
+                $params[]   = "%{$busqueda}%";
+            }
+
+            // OJO: sin filtro es_default — un producto puede tener varias unidades
+            // con existencia propia (ej. tallas: S, M, L cada una como unidad
+            // distinta), y cada una debe poder trasladarse por separado. Antes
+            // solo se traía la unidad marcada por defecto, ocultando las demás.
+            $sqlBase = "FROM bodega_inventario.productos p
+            INNER JOIN bodega_inventario.tipos_producto tp ON tp.id = p.id_tipo
+            INNER JOIN bodega_inventario.categorias_producto cp ON cp.id = p.id_categoria
+            INNER JOIN bodega_inventario.productos_unidades pu ON pu.id_producto = p.id AND pu.activo = 1
+            INNER JOIN bodega_inventario.unidades_medida um ON um.id = pu.id_unidad
+            INNER JOIN bodega_inventario.stock s ON s.id_producto = p.id AND s.id_bodega = ? AND s.id_unidad = pu.id_unidad
+            WHERE p.activo = 1 AND s.cantidad_disponible > 0 {$whereExtra}";
+
+            $sqlCount  = "SELECT COUNT(*) AS total_registros {$sqlBase}";
+            $stmtCount = $this->connect->prepare($sqlCount);
+            $stmtCount->execute($params);
+            $total = (int)($stmtCount->fetch(PDO::FETCH_OBJ)->total_registros ?? 0);
+
+            if ($total === 0) {
+                return $this->res->info('No se encontraron productos con existencias disponibles para trasladar desde esta bodega');
+            }
+
+            // Nota: id_unidad_default aquí es la unidad de ESTA fila (ej. la talla
+            // específica), no necesariamente la marcada como default del producto
+            // — el nombre del campo se conserva por compatibilidad con el frontend.
+            $sqlData = "SELECT
+                p.id, p.nombre, p.descripcion, p.id_tipo, tp.nombre AS tipo,
+                p.id_categoria, cp.nombre AS categoria,
+                um.id AS id_unidad_default, um.nombre AS unidad_default, um.abreviatura AS abreviatura_unidad,
+                s.cantidad_total, s.cantidad_reservada, s.cantidad_disponible
+            {$sqlBase}
+            ORDER BY {$ordenSQL} {$ordenDir}, um.nombre ASC
+            LIMIT {$porPagina} OFFSET {$offset}";
+
+            $stmtData = $this->connect->prepare($sqlData);
+            $stmtData->execute($params);
+            $productos = $stmtData->fetchAll(PDO::FETCH_OBJ);
+
+            foreach ($productos as $p) {
+                $p->id                  = (int)$p->id;
+                $p->id_tipo             = (int)$p->id_tipo;
+                $p->id_categoria        = (int)$p->id_categoria;
+                $p->id_unidad_default   = (int)$p->id_unidad_default;
+                $p->cantidad_total      = (float)$p->cantidad_total;
+                $p->cantidad_reservada  = (float)$p->cantidad_reservada;
+                $p->cantidad_disponible = (float)$p->cantidad_disponible;
+            }
+
+            return $this->res->ok('Inventario disponible de la bodega origen recuperado correctamente', [
+                'productos'  => $productos,
+                'total'      => $total,
+                'pagina'     => $pagina,
+                'por_pagina' => $porPagina,
+                'paginas'    => (int)ceil($total / $porPagina),
+                'bodega'     => (object)['id' => $idBodegaOrigen],
+            ]);
+
+        } catch (Exception $e) {
+            error_log("Error en listarProductosParaTrasladoMasivo: " . $e->getMessage());
+            return $this->res->fail('Error interno en el servidor al recuperar el inventario disponible para traslado masivo', $e);
+        }
+    }
+
+    /**
+     * Crea un traslado masivo: un solo destino, N líneas de producto.
+     * Ver el bloque de cabecera de esta sección para las reglas completas.
+     *
+     * POST: bodega_inventario/crearTrasladoMasivo
+     *
+     * @param object $datos {
+     *   contexto: string (area|agencia_corporativa),
+     *   id_bodega_origen: int|null,   // requerido solo si contexto = agencia_corporativa
+     *   id_bodega_destino: int,
+     *   lineas: [{id_producto:int, id_unidad:int, cantidad:float}, ...]
+     * }
+     */
+    public function crearTrasladoMasivo($datos): array
+    {
+        try {
+            if ($this->_moduloBloqueado('traslados')) {
+                return $this->res->fail('El módulo de traslados está temporalmente bloqueado por Contabilidad. Los traslados ya pendientes se pueden seguir aprobando, rechazando o recibiendo con normalidad.');
+            }
+
+            $this->_inicializarBodegaHelper();
+            $this->_inicializarStockHelper();
+            $this->_inicializarTrasladoHelper();
+
+            $datos = $this->limpiarDatos($datos);
+
+            try {
+                $idBodegaOrigen = $this->_resolverOrigenTrasladoMasivo($datos);
+            } catch (Exception $eAcceso) {
+                return $this->res->fail($eAcceso->getMessage());
+            }
+
+            $idBodegaDestino = (int)($datos->id_bodega_destino ?? 0);
+            $lineasEntrada   = $datos->lineas ?? [];
+
+            if ($idBodegaDestino < 1 || empty($lineasEntrada)) {
+                return $this->res->fail('Campos requeridos: bodega destino y al menos una línea de producto');
+            }
+            if ($idBodegaDestino === $idBodegaOrigen) {
+                return $this->res->fail('La bodega destino no puede ser la misma que la bodega de origen');
+            }
+
+            $bodegaDestino = $this->trasladoHelper->obtenerBodegaActiva($idBodegaDestino);
+            if (!$bodegaDestino) {
+                return $this->res->fail('La bodega de destino seleccionada no existe o se encuentra inactiva');
+            }
+
+            $this->connect->beginTransaction();
+
+            try {
+                $bodegaOrigenInfo     = $this->trasladoHelper->obtenerBodegaActiva($idBodegaOrigen);
+                $requiereAutorizacion = $bodegaOrigenInfo === null || $bodegaOrigenInfo->requiere_autorizacion_traslado;
+                $idEstado             = $requiereAutorizacion ? 1 : 2;
+
+                if ($idEstado === 2) {
+                    $this->connect->prepare(
+                        "INSERT INTO bodega_inventario.traslados
+                        (id_bodega_origen, id_bodega_destino, id_estado, es_masivo, id_usuario_encargado,
+                        comentario_admin, fecha_gestion)
+                        VALUES (?, ?, 2, 1, ?, ?, CURRENT_TIMESTAMP)"
+                    )->execute([
+                        $idBodegaOrigen, $idBodegaDestino, $this->idUsuario,
+                        'Auto-aprobado: la bodega de origen no requiere autorización',
+                    ]);
+                } else {
+                    $this->connect->prepare(
+                        "INSERT INTO bodega_inventario.traslados
+                        (id_bodega_origen, id_bodega_destino, id_estado, es_masivo, id_usuario_encargado)
+                        VALUES (?, ?, 1, 1, ?)"
+                    )->execute([$idBodegaOrigen, $idBodegaDestino, $this->idUsuario]);
+                }
+
+                $idTraslado = (int)$this->connect->lastInsertId();
+
+                $stmtInsertDetalle = $this->connect->prepare(
+                    "INSERT INTO bodega_inventario.traslados_detalle
+                        (id_traslado, id_producto, id_unidad, cantidad, id_lote_correlativo, id_lote_expiracion)
+                     VALUES (?, ?, ?, ?, ?, ?)"
+                );
+                $stmtPU = $this->connect->prepare(
+                    "SELECT pu.id FROM bodega_inventario.productos_unidades pu
+                     INNER JOIN bodega_inventario.productos p ON p.id = pu.id_producto
+                     WHERE pu.id_producto = ? AND pu.id_unidad = ? AND pu.activo = 1 AND p.activo = 1
+                     LIMIT 1"
+                );
+                $stmtTipo = $this->connect->prepare("SELECT id_tipo FROM bodega_inventario.productos WHERE id = ? LIMIT 1");
+
+                $lineasCreadas = [];
+                $omitidas      = [];
+
+                foreach ($lineasEntrada as $l) {
+                    $l = (array)$l; // ← AGREGAR: $datos->lineas llega como stdClass por elemento, no array asociativo
+
+                    $idProducto  = (int)($l['id_producto'] ?? 0);
+                    $idUnidad    = (int)($l['id_unidad'] ?? 0);
+                    $cantidadRaw = $l['cantidad'] ?? 0;
+
+                    if ($idProducto < 1 || $idUnidad < 1 || $cantidadRaw <= 0) {
+                        continue; // línea vacía/inválida del cliente — se ignora sin más
+                    }
+
+                    $stmtPU->execute([$idProducto, $idUnidad]);
+                    if (!$stmtPU->fetch(PDO::FETCH_OBJ)) {
+                        $omitidas[] = ['id_producto' => $idProducto, 'motivo' => 'Producto o unidad inválidos o inactivos'];
+                        continue;
+                    }
+
+                    $stmtTipo->execute([$idProducto]);
+                    $idTipoProducto = (int)$stmtTipo->fetchColumn();
+
+                    if ($idTipoProducto === 1) {
+                        $cantidadFinal = (int)round((float)$cantidadRaw);
+                        $asignaciones  = $this->trasladoHelper->autoAsignarYReservarCorrelativo($idBodegaOrigen, $idProducto, $cantidadFinal);
+
+                        if (empty($asignaciones)) {
+                            $omitidas[] = ['id_producto' => $idProducto, 'motivo' => 'No hay disponibilidad suficiente en ningún lote correlativo'];
+                            continue;
+                        }
+
+                        foreach ($asignaciones as $a) {
+                            $stmtInsertDetalle->execute([$idTraslado, $idProducto, $idUnidad, $a['cantidad'], $a['id_lote'], null]);
+                        }
+                        $this->stockHelper->incrementarReserva($idBodegaOrigen, $idProducto, $idUnidad, $cantidadFinal);
+                        $lineasCreadas[] = ['id_producto' => $idProducto, 'cantidad' => $cantidadFinal, 'lotes' => count($asignaciones)];
+
+                    } elseif ($idTipoProducto === 2) {
+                        $cantidadFinal = (float)$cantidadRaw;
+                        $asignaciones  = $this->trasladoHelper->autoAsignarYReservarExpiracion($idBodegaOrigen, $idProducto, $idUnidad, $cantidadFinal);
+
+                        if (empty($asignaciones)) {
+                            $omitidas[] = ['id_producto' => $idProducto, 'motivo' => 'No hay disponibilidad suficiente en ningún lote de expiración'];
+                            continue;
+                        }
+
+                        foreach ($asignaciones as $a) {
+                            $stmtInsertDetalle->execute([$idTraslado, $idProducto, $idUnidad, $a['cantidad'], null, $a['id_lote']]);
+                        }
+                        $this->stockHelper->incrementarReserva($idBodegaOrigen, $idProducto, $idUnidad, $cantidadFinal);
+                        $lineasCreadas[] = ['id_producto' => $idProducto, 'cantidad' => $cantidadFinal, 'lotes' => count($asignaciones)];
+
+                    } else {
+                        // Normal: no se reserva lote específico — resuelto por FIFO hasta confirmarRecepcion, igual que el traslado simple
+                        $cantidadFinal = (float)$cantidadRaw;
+                        $stockRaw      = $this->stockHelper->obtenerConBloqueo($idBodegaOrigen, $idProducto, $idUnidad);
+                        $disponible    = $stockRaw ? (float)$stockRaw['cantidad_disponible'] : 0.0;
+
+                        if (!$stockRaw || $cantidadFinal > $disponible) {
+                            $omitidas[] = ['id_producto' => $idProducto, 'motivo' => "Stock insuficiente. Disponible: {$disponible}"];
+                            continue;
+                        }
+
+                        $stmtInsertDetalle->execute([$idTraslado, $idProducto, $idUnidad, $cantidadFinal, null, null]);
+                        $this->stockHelper->incrementarReserva($idBodegaOrigen, $idProducto, $idUnidad, $cantidadFinal);
+                        $lineasCreadas[] = ['id_producto' => $idProducto, 'cantidad' => $cantidadFinal, 'lotes' => 1];
+                    }
+                }
+
+                if (empty($lineasCreadas)) {
+                    throw new Exception('No se pudo crear ninguna línea del traslado masivo — revise la disponibilidad de los productos indicados');
+                }
+
+                $this->connect->commit();
+
+                return $this->res->ok('El traslado masivo ha sido registrado correctamente', [
+                    'id_traslado'           => $idTraslado,
+                    'id_estado'             => $idEstado,
+                    'requiere_autorizacion' => $requiereAutorizacion,
+                    'lineas_creadas'        => $lineasCreadas,
+                    'omitidas'              => $omitidas,
+                ]);
+
+            } catch (Exception $eInterno) {
+                if ($this->connect->inTransaction()) {
+                    $this->connect->rollBack();
+                }
+                return $this->res->fail($eInterno->getMessage());
+            }
+
+        } catch (Exception $e) {
+            error_log("Error en crearTrasladoMasivo: " . $e->getMessage());
+            return $this->res->fail('Error interno en el servidor al intentar registrar el traslado masivo', $e);
+        }
+    }
+
+
+    /**
+     * Procesa la recepción física de UN renglón: consumo real
+     * (Correlativo/Expiración/Normal), movimientos de Kardex, lote espejo
+     * en destino, trazabilidad, y marca cantidad_entregada en el renglón
+     * (eso es lo que lo vuelve "recibido" — no hay una columna aparte).
+     *
+     * No valida estados ni hace commit/rollback — eso es responsabilidad
+     * del llamador, dentro de su propia transacción. Lo reutilizan tanto
+     * confirmarRecepcionTraslado (todas las líneas activas) como
+     * confirmarRecepcionLineaTraslado (una o varias líneas puntuales), para
+     * no duplicar esta lógica en dos lugares.
+     */
+    private function _procesarRecepcionRenglon(object $r, int $idBodegaOrigen, int $idBodegaDestino, int $idTraslado): void
+    {
+        $idProducto = (int)$r->id_producto;
+        $idUnidad   = (int)$r->id_unidad;
+        $idTipo     = (int)$r->id_tipo_producto;
+        $idDetalle  = (int)$r->id;
+
+        // ── TIPO 1: CORRELATIVO ─────────────────────────────────────────
+        if ($idTipo === 1) {
+            $cantidad  = (int)$r->cantidad;
+            $resultado = $this->trasladoHelper->consumirYCrearDestinoCorrelativo(
+                (int)$r->id_lote_correlativo, $cantidad, $idBodegaDestino, $this->idUsuario, $idTraslado
+            );
+
+            $this->stockHelper->descontarPorEntrega($idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $cantidad);
+            $this->stockHelper->incrementarPorAlta($idBodegaDestino, $idProducto, $idUnidad, $cantidad);
+
+            $this->movimientoHelper->registrarBajaTraslado(
+                $idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $idDetalle,
+                $resultado['correlativo_inicial'], $resultado['correlativo_final'], $resultado['precio_unitario']
+            );
+            $this->movimientoHelper->registrarAltaTraslado(
+                $idBodegaDestino, $idProducto, $idUnidad, $cantidad,
+                'lotes_correlativo', $resultado['id_lote_destino'],
+                $resultado['correlativo_inicial'], $resultado['correlativo_final'], $resultado['precio_unitario']
+            );
+
+            $this->trasladoHelper->insertarDetalleLote(
+                $idDetalle, $cantidad,
+                (int)$r->id_lote_correlativo, null, null,
+                $resultado['id_lote_destino'], null, null
+            );
+
+            $this->connect->prepare(
+                "UPDATE bodega_inventario.traslados_detalle
+                 SET precio_unitario = ?, cantidad_entregada = ?, correlativo_inicial = ?, correlativo_final = ?
+                 WHERE id = ?"
+            )->execute([
+                $resultado['precio_unitario'], $cantidad,
+                $resultado['correlativo_inicial'], $resultado['correlativo_final'], $idDetalle,
+            ]);
+
+            // ── TIPO 2: EXPIRACIÓN ──────────────────────────────────────────
+        } elseif ($idTipo === 2) {
+            $cantidad  = (float)$r->cantidad;
+            $resultado = $this->trasladoHelper->consumirYCrearDestinoExpiracion(
+                (int)$r->id_lote_expiracion, $cantidad, $idBodegaDestino, $idUnidad, $this->idUsuario, $idTraslado
+            );
+
+            $this->stockHelper->descontarPorEntrega($idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $cantidad);
+            $this->stockHelper->incrementarPorAlta($idBodegaDestino, $idProducto, $idUnidad, $cantidad);
+
+            $this->movimientoHelper->registrarBajaTraslado(
+                $idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $idDetalle,
+                null, null, $resultado['precio_unitario']
+            );
+            $this->movimientoHelper->registrarAltaTraslado(
+                $idBodegaDestino, $idProducto, $idUnidad, $cantidad,
+                'lotes_expiracion', $resultado['id_lote_destino'],
+                null, null, $resultado['precio_unitario']
+            );
+
+            $this->trasladoHelper->insertarDetalleLote(
+                $idDetalle, $cantidad,
+                null, (int)$r->id_lote_expiracion, null,
+                null, $resultado['id_lote_destino'], null
+            );
+
+            $this->connect->prepare(
+                "UPDATE bodega_inventario.traslados_detalle
+                 SET precio_unitario = ?, cantidad_entregada = ? WHERE id = ?"
+            )->execute([$resultado['precio_unitario'], $cantidad, $idDetalle]);
+
+            // ── TIPO 3: NORMAL (FIFO, posiblemente multi-lote) ──────────────
+        } else {
+            $cantidad = (float)$r->cantidad;
+            $consumos = $this->trasladoHelper->consumirYCrearDestinoNormal(
+                $idBodegaOrigen, $idProducto, $idUnidad, $cantidad, $idBodegaDestino, $this->idUsuario, $idTraslado
+            );
+
+            $totalConsumido = 0.0;
+            $primerPrecio   = null;
+
+            // Cada lote consumido genera su propio par de movimientos y su propia
+            // fila de trazabilidad, porque puede venir de lotes con precios distintos
+            foreach ($consumos as $c) {
+                $this->movimientoHelper->registrarBajaTraslado(
+                    $idBodegaOrigen, $idProducto, $idUnidad, $c['cantidad'], $idDetalle,
+                    null, null, $c['precio_unitario']
+                );
+                $this->movimientoHelper->registrarAltaTraslado(
+                    $idBodegaDestino, $idProducto, $idUnidad, $c['cantidad'],
+                    'lotes_normal', $c['id_lote_destino'],
+                    null, null, $c['precio_unitario']
+                );
+
+                $this->trasladoHelper->insertarDetalleLote(
+                    $idDetalle, $c['cantidad'],
+                    null, null, $c['id_lote_origen'],
+                    null, null, $c['id_lote_destino']
+                );
+
+                $totalConsumido += $c['cantidad'];
+                if ($primerPrecio === null) {
+                    $primerPrecio = $c['precio_unitario'];
+                }
+            }
+
+            $this->stockHelper->descontarPorEntrega($idBodegaOrigen, $idProducto, $idUnidad, $totalConsumido, $totalConsumido);
+            $this->stockHelper->incrementarPorAlta($idBodegaDestino, $idProducto, $idUnidad, $totalConsumido);
+
+            $this->connect->prepare(
+                "UPDATE bodega_inventario.traslados_detalle
+                 SET precio_unitario = ?, cantidad_entregada = ? WHERE id = ?"
+            )->execute([$primerPrecio, $totalConsumido, $idDetalle]);
+        }
+    }
+
+    /**
+     * Revisa si a un traslado ya no le queda ninguna línea ACTIVA (ni
+     * pendiente de recibir ni de cancelar) y, si es así, cierra la cabecera
+     * con el estado que corresponda:
+     *   - Ingresado (4)        si TODO lo que había se recibió, nada se canceló
+     *   - Cancelado (5)        si TODO se canceló, nada se recibió
+     *   - Recibido Parcial (6) si hubo una MEZCLA de líneas recibidas y canceladas
+     *
+     * Se llama al final de confirmarRecepcionTraslado, confirmarRecepcionLineaTraslado
+     * y cancelarLineaTraslado — así el cierre queda en un solo lugar, sin
+     * importar por cuál de los 3 caminos se llegó al final.
+     *
+     * @return int|null El estado final (4, 5 o 6) si se cerró, o null si aún quedan líneas activas.
+     */
+    private function _cerrarTrasladoSiCorresponde(int $idTraslado): ?int
+    {
+        $stmt = $this->connect->prepare(
+            "SELECT
+                SUM(CASE WHEN cancelado = 0 AND cantidad_entregada IS NULL THEN 1 ELSE 0 END) AS activas,
+                SUM(CASE WHEN cancelado = 1 THEN 1 ELSE 0 END) AS canceladas,
+                SUM(CASE WHEN cancelado = 0 AND cantidad_entregada IS NOT NULL THEN 1 ELSE 0 END) AS recibidas
+             FROM bodega_inventario.traslados_detalle
+             WHERE id_traslado = ?"
+        );
+        $stmt->execute([$idTraslado]);
+        $conteo = $stmt->fetch(PDO::FETCH_OBJ);
+
+        if (!$conteo || (int)$conteo->activas > 0) {
+            return null; // todavía hay líneas pendientes — el traslado sigue abierto
+        }
+
+        $canceladas = (int)$conteo->canceladas;
+        $recibidas  = (int)$conteo->recibidas;
+
+        if ($recibidas > 0 && $canceladas > 0) {
+            $estadoFinal = 6; // Recibido Parcial
+        } elseif ($recibidas > 0) {
+            $estadoFinal = 4; // Ingresado
+        } else {
+            $estadoFinal = 5; // Cancelado
+        }
+
+        $this->connect->prepare(
+            "UPDATE bodega_inventario.traslados SET id_estado = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+        )->execute([$estadoFinal, $idTraslado]);
+
+        return $estadoFinal;
+    }
+
+
+    /**
+     * Libera la reserva (lote específico + agregada en stock) de UN renglón
+     * y lo marca cancelado con motivo/fecha/usuario. No valida nada — el
+     * llamador (cancelarLineaTraslado o _liberarReservasTraslado) ya se
+     * aseguró de que el renglón sea válido para cancelar.
+     */
+    private function _liberarYCancelarRenglon(object $r, int $idBodegaOrigen, string $motivo): void
+    {
+        if ($r->id_lote_correlativo !== null) {
+            $this->trasladoHelper->liberarLoteCorrelativo((int)$r->id_lote_correlativo, (int)$r->cantidad);
+        } elseif ($r->id_lote_expiracion !== null) {
+            $this->trasladoHelper->liberarLoteExpiracion((int)$r->id_lote_expiracion, (float)$r->cantidad);
+        }
+
+        $this->stockHelper->liberarReserva($idBodegaOrigen, (int)$r->id_producto, (int)$r->id_unidad, (float)$r->cantidad);
+
+        $this->connect->prepare(
+            "UPDATE bodega_inventario.traslados_detalle
+             SET cancelado = 1, motivo_cancelacion = ?, fecha_cancelacion = CURRENT_TIMESTAMP, id_usuario_cancelacion = ?
+             WHERE id = ?"
+        )->execute([$motivo, $this->idUsuario, (int)$r->id]);
+    }
+
+    /**
+     * Cancela UNA línea de un traslado (no todo el traslado), mientras la
+     * cabecera esté Pendiente (1) o Aprobado (2) y esa línea siga activa
+     * (ni recibida ni cancelada). La usa el encargado de la bodega ORIGEN
+     * — el mismo que puede cancelar el traslado completo.
+     *
+     * Libera la reserva de esa línea únicamente (lote específico + agregada
+     * en stock) y la marca cancelada, sin tocar las demás líneas. Si esta
+     * era la última línea activa, la cabecera se cierra automáticamente —
+     * ver _cerrarTrasladoSiCorresponde().
+     *
+     * POST: bodega_inventario/cancelarLineaTraslado
+     *
+     * @param object $datos { id_traslado_detalle: int, motivo: string }
+     */
+    public function cancelarLineaTraslado($datos): array
+    {
+        try {
+            $this->_inicializarBodegaHelper();
+            $this->_inicializarStockHelper();
+            $this->_inicializarTrasladoHelper();
+
+            $datos     = $this->limpiarDatos($datos);
+            $idDetalle = (int)($datos->id_traslado_detalle ?? 0);
+            $motivo    = trim($datos->motivo ?? '');
+
+            if ($idDetalle < 1 || $motivo === '') {
+                return $this->res->fail('Se requiere id_traslado_detalle y el motivo de la cancelación');
+            }
+
+            $this->connect->beginTransaction();
+
+            try {
+                $stmt = $this->connect->prepare(
+                    "SELECT td.id, td.id_traslado, td.id_producto, td.id_unidad, td.cantidad,
+                            td.id_lote_correlativo, td.id_lote_expiracion, td.cancelado, td.cantidad_entregada,
+                            t.id_bodega_origen, t.id_estado, t.id_usuario_encargado
+                     FROM bodega_inventario.traslados_detalle td
+                     INNER JOIN bodega_inventario.traslados t ON t.id = td.id_traslado
+                     WHERE td.id = ?
+                     FOR UPDATE"
+                );
+                $stmt->execute([$idDetalle]);
+                $renglon = $stmt->fetch(PDO::FETCH_OBJ);
+
+                if (!$renglon) {
+                    throw new Exception('El renglón especificado no existe en el sistema');
+                }
+                if ($renglon->id_usuario_encargado !== $this->idUsuario) {
+                    throw new Exception('Acceso denegado: No es usted el encargado que generó este traslado');
+                }
+                if (!in_array((int)$renglon->id_estado, [1, 2], true)) {
+                    throw new Exception('Operación rechazada: Solo se pueden cancelar líneas de traslados en estado Pendiente o Aprobado');
+                }
+                if ((int)$renglon->cancelado === 1) {
+                    throw new Exception('Esta línea ya había sido cancelada');
+                }
+                if ($renglon->cantidad_entregada !== null) {
+                    throw new Exception('Esta línea ya fue recibida — no se puede cancelar');
+                }
+
+                $this->_liberarYCancelarRenglon($renglon, (int)$renglon->id_bodega_origen, $motivo);
+
+                $idTraslado  = (int)$renglon->id_traslado;
+                $estadoFinal = $this->_cerrarTrasladoSiCorresponde($idTraslado);
+
+                $this->connect->commit();
+
+                $mensaje = $estadoFinal !== null
+                    ? ($estadoFinal === 5
+                        ? 'La línea ha sido cancelada; era la última línea activa, así que el traslado completo también quedó Cancelado'
+                        : 'La línea ha sido cancelada; era la última línea activa — como algunas otras ya se habían recibido, el traslado quedó como Recibido Parcial')
+                    : 'La línea ha sido cancelada y su reserva liberada correctamente';
+
+                return $this->res->ok($mensaje, ['id_traslado' => $idTraslado, 'estado_final' => $estadoFinal]);
+
+            } catch (Exception $eInterno) {
+                if ($this->connect->inTransaction()) {
+                    $this->connect->rollBack();
+                }
+                return $this->res->fail($eInterno->getMessage());
+            }
+
+        } catch (Exception $e) {
+            error_log("Error en cancelarLineaTraslado: " . $e->getMessage());
+            return $this->res->fail('Error interno en el servidor al intentar cancelar la línea del traslado', $e);
+        }
+    }
+
+    /**
+     * Confirma la recepción de una o VARIAS líneas puntuales de un traslado
+     * Aprobado (2) — no todas de una vez. La usa el encargado de la bodega
+     * DESTINO, igual que confirmarRecepcionTraslado.
+     *
+     * Las líneas que ya estén recibidas o canceladas se omiten (no fallan
+     * el resto). Si tras procesar ya no queda ninguna línea activa, la
+     * cabecera se cierra automáticamente — ver _cerrarTrasladoSiCorresponde().
+     *
+     * POST: bodega_inventario/confirmarRecepcionLineaTraslado
+     *
+     * @param object $datos {
+     *   id_traslado: int,
+     *   contexto: string (area|agencia),
+     *   ids_traslado_detalle: int[]
+     * }
+     */
+    public function confirmarRecepcionLineaTraslado($datos): array
+    {
+        try {
+            $this->_inicializarBodegaHelper();
+            $this->_inicializarStockHelper();
+            $this->_inicializarMovimientoHelper();
+            $this->_inicializarTrasladoHelper();
+
+            $datos      = $this->limpiarDatos($datos);
+            $idTraslado = (int)($datos->id_traslado ?? 0);
+            $contexto   = trim($datos->contexto ?? '');
+            $idsDetalle = array_values(array_unique(array_map('intval', (array)($datos->ids_traslado_detalle ?? []))));
+
+            if ($idTraslado < 1 || empty($idsDetalle)) {
+                return $this->res->fail('Se requiere id_traslado y al menos un id en ids_traslado_detalle');
+            }
+            if (!in_array($contexto, ['area', 'agencia'], true)) {
+                return $this->res->fail('El campo contexto es requerido (area | agencia)');
+            }
+
+            $this->connect->beginTransaction();
+
+            try {
+                $stmtCab = $this->connect->prepare(
+                    "SELECT id, id_bodega_origen, id_bodega_destino, id_estado
+                     FROM bodega_inventario.traslados WHERE id = ? FOR UPDATE"
+                );
+                $stmtCab->execute([$idTraslado]);
+                $traslado = $stmtCab->fetch(PDO::FETCH_OBJ);
+
+                if (!$traslado) {
+                    throw new Exception('El traslado especificado no existe en el sistema');
+                }
+                if ((int)$traslado->id_estado !== 2) {
+                    throw new Exception('Operación rechazada: Solo se puede confirmar la recepción de traslados en estado Aprobado');
+                }
+
+                $idBodegaOrigen  = (int)$traslado->id_bodega_origen;
+                $idBodegaDestino = (int)$traslado->id_bodega_destino;
+
+                $idBodegaContexto = (int)$this->bodegaHelper->obtenerBodegaPorContexto($contexto);
+                if (!$idBodegaContexto || $idBodegaContexto !== $idBodegaDestino) {
+                    throw new Exception('Acceso denegado: No es usted el encargado de la bodega destino de este traslado');
+                }
+                if (!$this->trasladoHelper->bodegaDestinoSigueActiva($idBodegaDestino)) {
+                    throw new Exception('No es posible confirmar la recepción: la bodega destino se encuentra inactiva');
+                }
+
+                $placeholders = implode(',', array_fill(0, count($idsDetalle), '?'));
+                $stmtDet = $this->connect->prepare(
+                    "SELECT td.id, td.id_producto, td.id_unidad, td.cantidad, td.cancelado, td.cantidad_entregada,
+                            td.id_lote_correlativo, td.id_lote_expiracion, p.id_tipo AS id_tipo_producto
+                     FROM bodega_inventario.traslados_detalle td
+                     INNER JOIN bodega_inventario.productos p ON p.id = td.id_producto
+                     WHERE td.id_traslado = ? AND td.id IN ({$placeholders})
+                     FOR UPDATE"
+                );
+                $stmtDet->execute(array_merge([$idTraslado], $idsDetalle));
+                $renglones = $stmtDet->fetchAll(PDO::FETCH_OBJ);
+
+                $procesadas = [];
+                $omitidas   = [];
+
+                foreach ($renglones as $r) {
+                    if ((int)$r->cancelado === 1) {
+                        $omitidas[] = ['id_traslado_detalle' => (int)$r->id, 'motivo' => 'Esta línea ya estaba cancelada'];
+                        continue;
+                    }
+                    if ($r->cantidad_entregada !== null) {
+                        $omitidas[] = ['id_traslado_detalle' => (int)$r->id, 'motivo' => 'Esta línea ya había sido recibida'];
+                        continue;
+                    }
+
+                    $this->_procesarRecepcionRenglon($r, $idBodegaOrigen, $idBodegaDestino, $idTraslado);
+                    $procesadas[] = (int)$r->id;
+                }
+
+                $idsEncontrados = array_map(static fn ($r) => (int)$r->id, $renglones);
+                foreach ($idsDetalle as $idSolicitado) {
+                    if (!in_array($idSolicitado, $idsEncontrados, true)) {
+                        $omitidas[] = ['id_traslado_detalle' => $idSolicitado, 'motivo' => 'No pertenece a este traslado'];
+                    }
+                }
+
+                if (empty($procesadas)) {
+                    throw new Exception('No se procesó ninguna línea — revise que no estén ya recibidas o canceladas');
+                }
+
+                $estadoFinal = $this->_cerrarTrasladoSiCorresponde($idTraslado);
+
+                $this->connect->commit();
+
+                $mensaje = $estadoFinal === 6
+                    ? 'Las líneas seleccionadas fueron recibidas; como el resto ya estaba cancelado, el traslado quedó como Recibido Parcial'
+                    : ($estadoFinal === 4
+                        ? 'Las líneas seleccionadas fueron recibidas; era todo lo que faltaba, el traslado quedó Ingresado'
+                        : 'Las líneas seleccionadas fueron recibidas correctamente; el traslado sigue Aprobado con líneas pendientes');
+
+                return $this->res->ok($mensaje, [
+                    'id_traslado'  => $idTraslado,
+                    'procesadas'   => $procesadas,
+                    'omitidas'     => $omitidas,
+                    'estado_final' => $estadoFinal
+                ]);
+
+            } catch (Exception $eInterno) {
+                if ($this->connect->inTransaction()) {
+                    $this->connect->rollBack();
+                }
+                return $this->res->fail($eInterno->getMessage());
+            }
+
+        } catch (Exception $e) {
+            error_log("Error en confirmarRecepcionLineaTraslado: " . $e->getMessage());
+            return $this->res->fail('Error interno en el servidor al intentar confirmar la recepción de las líneas', $e);
+        }
+    }
+
+    /**
+     * Evalúa cómo quedaron las líneas ACTIVAS (ni canceladas por el encargado)
+     * de un traslado tras aprobar/rechazar una línea individual, y devuelve el
+     * id_estado que corresponde aplicar a la cabecera, o null si aún hay líneas
+     * sin decidir (el traslado sigue Pendiente).
+     */
+    private function _evaluarAprobacionTraslado(int $idTraslado): ?int
+    {
+        $stmt = $this->connect->prepare(
+            "SELECT
+            SUM(CASE WHEN cancelado = 0 AND rechazado = 0 AND aprobado = 0 THEN 1 ELSE 0 END) AS pendientes,
+            SUM(CASE WHEN cancelado = 0 AND rechazado = 0 AND aprobado = 1 THEN 1 ELSE 0 END) AS aprobadas,
+            SUM(CASE WHEN rechazado = 1 THEN 1 ELSE 0 END) AS rechazadas
+         FROM bodega_inventario.traslados_detalle
+         WHERE id_traslado = ?"
+        );
+        $stmt->execute([$idTraslado]);
+        $r = $stmt->fetch(PDO::FETCH_OBJ);
+
+        $pendientes = (int)$r->pendientes;
+        $aprobadas  = (int)$r->aprobadas;
+        $rechazadas = (int)$r->rechazadas;
+
+        if ($pendientes > 0) {
+            return null; // aún hay líneas sin decidir
+        }
+        if ($aprobadas === 0 && $rechazadas === 0) {
+            return null; // todo lo restante fue cancelado por el encargado; no le corresponde a esta función
+        }
+        if ($aprobadas > 0 && $rechazadas > 0) {
+            return 7; // Rechazo Parcial
+        }
+        if ($rechazadas > 0) {
+            return 3; // Rechazado
+        }
+        return 2; // Aprobado
+    }
+
+    /**
+     * Aprueba UNA línea de un traslado Pendiente (1) o Aprobado (2), sin afectar
+     * las demás líneas ni mover stock (la aprobación nunca lo hizo). Cuando ya
+     * no quedan líneas activas por decidir, _evaluarAprobacionTraslado() decide
+     * el estado final de la cabecera (Aprobado / Rechazado / Rechazo Parcial).
+     *
+     * POST: bodega_inventario/aprobarLineaTraslado
+     *
+     * @param object $datos { id_traslado_detalle: int }
+     */
+    public function aprobarLineaTraslado($datos): array
+    {
+        try {
+            $datos     = $this->limpiarDatos($datos);
+            $idDetalle = (int)($datos->id_traslado_detalle ?? 0);
+
+            if ($idDetalle < 1) {
+                return $this->res->fail('El campo id_traslado_detalle es requerido y debe ser un entero positivo');
+            }
+
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para aprobar líneas de traslado. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $this->connect->beginTransaction();
+
+            $stmt = $this->connect->prepare(
+                "SELECT td.id, td.id_traslado, td.cancelado, td.rechazado, td.aprobado, t.id_estado
+             FROM bodega_inventario.traslados_detalle td
+             INNER JOIN bodega_inventario.traslados t ON t.id = td.id_traslado
+             WHERE td.id = ? FOR UPDATE"
+            );
+            $stmt->execute([$idDetalle]);
+            $linea = $stmt->fetch(PDO::FETCH_OBJ);
+
+            if (!$linea) {
+                $this->connect->rollBack();
+                return $this->res->fail('La línea especificada no existe');
+            }
+            if (!in_array((int)$linea->id_estado, [1, 2], true)) {
+                $this->connect->rollBack();
+                return $this->res->fail('Operación rechazada: El traslado ya no admite gestión por línea');
+            }
+            if ((int)$linea->cancelado === 1) {
+                $this->connect->rollBack();
+                return $this->res->fail('La línea ya fue cancelada por el encargado y no puede aprobarse');
+            }
+            if ((int)$linea->rechazado === 1) {
+                $this->connect->rollBack();
+                return $this->res->fail('La línea ya fue rechazada y no puede aprobarse');
+            }
+            if ((int)$linea->aprobado === 1) {
+                $this->connect->rollBack();
+                return $this->res->fail('La línea ya había sido aprobada');
+            }
+
+            $this->connect->prepare(
+                "UPDATE bodega_inventario.traslados_detalle
+             SET aprobado = 1, fecha_aprobacion = CURRENT_TIMESTAMP, id_usuario_aprobacion = ?
+             WHERE id = ?"
+            )->execute([$this->idUsuario, $idDetalle]);
+
+            $idTraslado  = (int)$linea->id_traslado;
+            $nuevoEstado = $this->_evaluarAprobacionTraslado($idTraslado);
+
+            $mensaje = 'La línea ha sido aprobada correctamente';
+            if ($nuevoEstado !== null) {
+                $this->connect->prepare(
+                    "UPDATE bodega_inventario.traslados SET id_estado = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+                )->execute([$nuevoEstado, $idTraslado]);
+
+                $mensaje = $nuevoEstado === 2
+                    ? 'La línea ha sido aprobada. Todas las líneas quedaron aprobadas: el traslado pasó a Aprobado'
+                    : 'La línea ha sido aprobada. El traslado quedó en Rechazo Parcial (hay líneas rechazadas y líneas aprobadas)';
+            }
+
+            $this->connect->commit();
+            return $this->res->ok($mensaje, ['estado_final' => $nuevoEstado]);
+
+        } catch (Exception $e) {
+            if ($this->connect->inTransaction()) $this->connect->rollBack();
+            error_log("Error en aprobarLineaTraslado: " . $e->getMessage());
+            return $this->res->fail('Error interno en el servidor al intentar aprobar la línea', $e);
+        }
+    }
+
+    /**
+     * Rechaza UNA línea de un traslado Pendiente (1) o Aprobado (2), liberando
+     * su reserva de stock, sin afectar las demás líneas. Cuando ya no quedan
+     * líneas activas por decidir, _evaluarAprobacionTraslado() decide el estado
+     * final de la cabecera (Aprobado / Rechazado / Rechazo Parcial).
+     *
+     * POST: bodega_inventario/rechazarLineaTraslado
+     *
+     * @param object $datos { id_traslado_detalle: int, motivo: string }
+     */
+    public function rechazarLineaTraslado($datos): array
+    {
+        try {
+            $this->_inicializarStockHelper();
+            $this->_inicializarTrasladoHelper();
+
+            $datos     = $this->limpiarDatos($datos);
+            $idDetalle = (int)($datos->id_traslado_detalle ?? 0);
+            $motivo    = trim($datos->motivo ?? '');
+
+            if ($idDetalle < 1 || $motivo === '') {
+                return $this->res->fail('Se requiere el id_traslado_detalle y el motivo (obligatorio) del rechazo');
+            }
+
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('No tiene permisos para rechazar líneas de traslado. Se requiere rol de Administrador de Bodegas.');
+            }
+
+            $this->connect->beginTransaction();
+
+            $stmt = $this->connect->prepare(
+                "SELECT td.id, td.id_traslado, td.id_producto, td.id_unidad, td.cantidad,
+            td.id_lote_correlativo, td.id_lote_expiracion,
+            td.cancelado, td.rechazado, td.cantidad_entregada,
+            t.id_estado, t.id_bodega_origen
+            FROM bodega_inventario.traslados_detalle td
+            INNER JOIN bodega_inventario.traslados t ON t.id = td.id_traslado
+            WHERE td.id = ? FOR UPDATE"
+            );
+            $stmt->execute([$idDetalle]);
+            $r = $stmt->fetch(PDO::FETCH_OBJ);
+
+            if (!$r) {
+                $this->connect->rollBack();
+                return $this->res->fail('La línea especificada no existe');
+            }
+            if (!in_array((int)$r->id_estado, [1, 2], true)) {
+                $this->connect->rollBack();
+                return $this->res->fail('Operación rechazada: El traslado ya no admite gestión por línea');
+            }
+            if ((int)$r->cancelado === 1) {
+                $this->connect->rollBack();
+                return $this->res->fail('La línea ya fue cancelada por el encargado');
+            }
+            if ((int)$r->rechazado === 1) {
+                $this->connect->rollBack();
+                return $this->res->fail('La línea ya había sido rechazada');
+            }
+            if ($r->cantidad_entregada !== null) {
+                $this->connect->rollBack();
+                return $this->res->fail('La línea ya fue entregada, no puede rechazarse');
+            }
+
+            $this->_liberarYRechazarRenglon($r, (int)$r->id_bodega_origen, $motivo);
+
+            $idTraslado  = (int)$r->id_traslado;
+            $nuevoEstado = $this->_evaluarAprobacionTraslado($idTraslado);
+
+            $mensaje = 'La línea ha sido rechazada y la reserva de existencias liberada correctamente';
+            if ($nuevoEstado !== null) {
+                $this->connect->prepare(
+                    "UPDATE bodega_inventario.traslados SET id_estado = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+                )->execute([$nuevoEstado, $idTraslado]);
+
+                $mensaje = $nuevoEstado === 3
+                    ? 'La línea ha sido rechazada. Era la última línea activa: el traslado completo pasó a Rechazado'
+                    : 'La línea ha sido rechazada. El traslado quedó en Rechazo Parcial (hay líneas rechazadas y líneas aprobadas)';
+            }
+
+            $this->connect->commit();
+            return $this->res->ok($mensaje, ['estado_final' => $nuevoEstado]);
+
+        } catch (Exception $e) {
+            if ($this->connect->inTransaction()) $this->connect->rollBack();
+            error_log("Error en rechazarLineaTraslado: " . $e->getMessage());
+            return $this->res->fail('Error interno en el servidor al intentar rechazar la línea', $e);
+        }
+    }
+
+    private function _liberarYRechazarRenglon(object $r, int $idBodegaOrigen, string $motivo): void
+    {
+        $cantidad = (float)$r->cantidad;
+
+        if ($r->id_lote_correlativo !== null) {
+            $this->connect->prepare(
+                "UPDATE bodega_inventario.lotes_correlativo
+             SET cantidad_reservada = cantidad_reservada - ?
+             WHERE id = ?"
+            )->execute([(int)$cantidad, (int)$r->id_lote_correlativo]);
+
+        } elseif ($r->id_lote_expiracion !== null) {
+            $this->connect->prepare(
+                "UPDATE bodega_inventario.lotes_expiracion
+             SET cantidad_reservada = cantidad_reservada - ?
+             WHERE id = ?"
+            )->execute([$cantidad, (int)$r->id_lote_expiracion]);
+        }
+
+        // Reserva agregada (Correlativo, Expiración y Normal la usan por igual)
+        $this->connect->prepare(
+            "UPDATE bodega_inventario.stock
+         SET cantidad_reservada = cantidad_reservada - ?
+         WHERE id_bodega = ? AND id_producto = ? AND id_unidad = ?"
+        )->execute([$cantidad, $idBodegaOrigen, (int)$r->id_producto, (int)$r->id_unidad]);
+
+        $this->connect->prepare(
+            "UPDATE bodega_inventario.traslados_detalle
+         SET rechazado = 1, motivo_rechazo = ?, fecha_rechazo = CURRENT_TIMESTAMP, id_usuario_rechazo = ?
+         WHERE id = ?"
+        )->execute([$motivo, $this->idUsuario, $r->id]);
     }
 }
 // FIN DE inventarioApiClass

@@ -13,11 +13,14 @@ use RuntimeException;
  * movimiento tipo 3 (Alta por reversa) por cada lote restaurado.
  *
  * Estrategia por tipo de producto:
- *   - Correlativo (tipo 1): restaura sobre el lote ORIGINAL usando los rangos
- *     guardados en solicitudes_detalle (par principal + par _2 si la entrega
- *     cruzó dos lotes). Solo es válido si el rango es contiguo con el puntero
- *     correlativo_siguiente; si hay correlativos posteriores emitidos del mismo
- *     lote (hueco no representable), se rechaza.
+ *   - Correlativo (tipo 1): restaura sobre los lotes ORIGINALES usando el
+ *     rango guardado por lote en solicitudes_detalle_lotes (sin límite de
+ *     cuántos lotes cruzó la entrega). Solo es válido si cada rango es
+ *     contiguo con el puntero correlativo_siguiente de su propio lote; si
+ *     hay correlativos posteriores emitidos del mismo lote (hueco no
+ *     representable), se rechaza. Entregas registradas antes de esta
+ *     corrección (sin el rango guardado por lote) caen a un método legado
+ *     limitado a 2 lotes, leyendo las columnas resumen de solicitudes_detalle.
  *   - Expiración (tipo 2) y Normal (tipo 3): lee solicitudes_detalle_lotes y
  *     devuelve cada cantidad a su lote exacto (preserva PEPS/FIFO y fechas).
  *
@@ -50,10 +53,17 @@ class ReversaHelper
     // =========================================================================
 
     /**
-     * Revierte una entrega de producto correlativo restaurando sobre el lote
-     * original. Procesa el par principal y, si existe, el par secundario (_2).
+     * Revierte una entrega de producto correlativo restaurando sobre el/los
+     * lote(s) original(es). Lee la trazabilidad completa de
+     * solicitudes_detalle_lotes — sin límite de lotes cruzados.
      *
-     * @param object $detalle  Fila de solicitudes_detalle (con rangos y lotes)
+     * Compatibilidad: entregas registradas ANTES de esta corrección no
+     * guardaron el rango por lote en solicitudes_detalle_lotes (solo la
+     * cantidad) — para esas, cae al método legado que lee las columnas
+     * resumen de solicitudes_detalle (válido porque ese formato antiguo
+     * nunca pudo representar más de 2 lotes de todas formas).
+     *
+     * @param object $detalle  Fila de solicitudes_detalle (con rangos y lotes, para el camino legado)
      * @param int    $idBodega
      * @param int    $idProducto
      * @param int    $idDetalle
@@ -65,9 +75,46 @@ class ReversaHelper
     public function revertirEntregaCorrelativo(
         object $detalle, int $idBodega, int $idProducto, int $idDetalle
     ): float {
+        $stmt = $this->connect->prepare(
+            "SELECT id_lote_corr, correlativo_inicial, correlativo_final
+             FROM   bodega_inventario.solicitudes_detalle_lotes
+             WHERE  id_solicitud_det = ? AND id_lote_corr IS NOT NULL"
+        );
+        $stmt->execute([$idDetalle]);
+        $filas = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $esFormatoNuevo = !empty($filas) && count(array_filter(
+                $filas, static fn ($f) => $f['correlativo_inicial'] === null
+            )) === 0;
+
+        if (!$esFormatoNuevo) {
+            return $this->_revertirEntregaCorrelativoLegado($detalle, $idBodega, $idProducto, $idDetalle);
+        }
+
+        $total = 0.0;
+        foreach ($filas as $f) {
+            $total += $this->_restaurarRangoCorrelativo(
+                (int)$f['id_lote_corr'],
+                (int)$f['correlativo_inicial'],
+                (int)$f['correlativo_final'],
+                $idBodega, $idProducto, $idDetalle
+            );
+        }
+
+        return $total;
+    }
+
+    /**
+     * Camino legado (entregas anteriores a la corrección del tope de 2 lotes):
+     * lee el par principal y, si existe, el par secundario (_2) directo de
+     * las columnas resumen de solicitudes_detalle. Solo cubre hasta 2 lotes
+     * — es exactamente lo que ese formato antiguo alcanzó a guardar.
+     */
+    private function _revertirEntregaCorrelativoLegado(
+        object $detalle, int $idBodega, int $idProducto, int $idDetalle
+    ): float {
         $total = 0.0;
 
-        // Par principal
         $total += $this->_restaurarRangoCorrelativo(
             (int)$detalle->id_lote_correlativo,
             (int)$detalle->correlativo_inicial_asignado,
@@ -75,7 +122,6 @@ class ReversaHelper
             $idBodega, $idProducto, $idDetalle
         );
 
-        // Par secundario (solo si la entrega cruzó dos lotes)
         if ($detalle->id_lote_correlativo_2 !== null) {
             $total += $this->_restaurarRangoCorrelativo(
                 (int)$detalle->id_lote_correlativo_2,

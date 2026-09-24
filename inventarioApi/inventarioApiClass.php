@@ -41,6 +41,8 @@ use App\inventarioApi\Helpers\SolicitudNotificacionHelper;
 
 use App\inventarioApi\Helpers\FacturaBodegaHelper;
 
+use App\inventarioApi\Enums\CategoriaProducto;
+
 use ConexionBD;
 use Exception;
 use PDO;
@@ -200,7 +202,8 @@ final class inventarioApiClass extends ConexionBD
         'listarComprasExtraordinariasAdmin',
         'obtenerCompraExtraordinaria',
         'calcularSugerenciaTrimestralPropia',
-        'listarBodegasDestinoTrasladoMasivo'
+        'listarBodegasDestinoTrasladoMasivo',
+        'obtenerReporteMisGastosUniformes'
     ];
 
     /** @var array<string> Métodos expuestos como POST. */
@@ -15370,6 +15373,81 @@ FROM
          SET rechazado = 1, motivo_rechazo = ?, fecha_rechazo = CURRENT_TIMESTAMP, id_usuario_rechazo = ?
          WHERE id = ?"
         )->execute([$motivo, $this->idUsuario, $r->id]);
+    }
+
+
+    /**
+     * GET: bodega_inventario/obtenerReporteMisGastosUniformes?anio=
+     * Reporte personal (sin rol especial, cada usuario ve solo lo suyo):
+     * suma lo que el usuario en sesión ha recibido en la categoría
+     * Uniformes durante el año indicado (por defecto el año en curso),
+     * sin importar si la entrega vino de una solicitud normal o de una
+     * Entrega Directa. Se apoya en movimientos_stock (tipos 5 y 7) igual
+     * que el resto de reportes de este bloque, filtrando por
+     * id_usuario_receptor: ese campo queda igual al solicitante tanto en
+     * el flujo normal (ver entregarSolicitud) como en Entrega Directa
+     * (ver EntregaDirectaHelper::confirmar), así que cubre ambos casos
+     * con una sola condición.
+     *
+     * La categoría está fija a CategoriaProducto::UNIFORMES; si el id
+     * cambia en bodega_inventario.categorias_producto basta con
+     * actualizar ese enum.
+     */
+    public function obtenerReporteMisGastosUniformes(): array
+    {
+        try {
+            if (empty($this->idUsuario)) {
+                return $this->res->fail('No hay una sesión de usuario válida');
+            }
+
+            $anio = filter_input(INPUT_GET, 'anio', FILTER_VALIDATE_INT) ?: (int)date('Y');
+            if ($anio < 2000 || $anio > (int)date('Y') + 1) {
+                return $this->res->fail('El año indicado no es válido');
+            }
+
+            $sql = "SELECT ms.id, ms.id_bodega, b.nombre AS bodega,
+                   s.id AS id_solicitud, s.es_entrega_directa,
+                   ms.id_producto, p.nombre AS producto,
+                   ms.cantidad, ms.id_unidad, um.abreviatura AS unidad,
+                   ms.precio_unitario,
+                   ROUND(ms.cantidad * COALESCE(ms.precio_unitario, 0), 2) AS subtotal,
+                   ms.created_at AS fecha_entrega
+            FROM bodega_inventario.movimientos_stock ms
+            INNER JOIN bodega_inventario.solicitudes_detalle sd
+                    ON sd.id = ms.id_entidad_origen AND ms.entidad_origen = 'solicitudes_detalle'
+            INNER JOIN bodega_inventario.solicitudes s ON s.id = sd.id_solicitud
+            INNER JOIN bodega_inventario.productos p ON p.id = ms.id_producto
+            INNER JOIN bodega_inventario.bodegas b ON b.id = ms.id_bodega
+            INNER JOIN bodega_inventario.unidades_medida um ON um.id = ms.id_unidad
+            WHERE ms.id_tipo_movimiento IN (5, 7)
+              AND ms.id_usuario_receptor = ?
+              AND p.id_categoria = ?
+              AND YEAR(ms.created_at) = ?
+            ORDER BY ms.created_at ASC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute([$this->idUsuario, CategoriaProducto::UNIFORMES->value, $anio]);
+            $entregas = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($entregas)) {
+                return $this->res->info('No tiene entregas de uniformes registradas en ' . $anio, null, [
+                    'anio' => $anio,
+                    'entregas' => [],
+                    'total_entregas' => 0,
+                    'monto_total' => 0,
+                ]);
+            }
+
+            return $this->res->ok('Reporte de gastos en uniformes obtenido', [
+                'anio' => $anio,
+                'entregas' => $entregas,
+                'total_entregas' => count($entregas),
+                'monto_total' => round(array_sum(array_column($entregas, 'subtotal')), 2),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteMisGastosUniformes: " . $e->getMessage());
+            return $this->res->fail('Error al obtener el reporte de gastos en uniformes', $e);
+        }
     }
 }
 // FIN DE inventarioApiClass

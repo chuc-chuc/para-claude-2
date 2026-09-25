@@ -297,7 +297,7 @@ class StockConsultaHelper
         $stmt = $this->connect->prepare(
             "SELECT id, serie, resolucion, fecha_resolucion,
                     correlativo_inicial, correlativo_final, correlativo_siguiente,
-                    cantidad_disponible, cantidad_reservada, created_at
+                    cantidad_disponible, cantidad_reservada, created_at, precio_unitario
              FROM   bodega_inventario.lotes_correlativo
              WHERE  id_bodega = ? AND id_producto = ? AND cantidad_disponible > 0
              ORDER  BY correlativo_inicial ASC"
@@ -391,7 +391,8 @@ class StockConsultaHelper
                     p.nombre AS producto, cp.nombre AS categoria, 'Correlativo' AS tipo_producto,
                     lc.serie, lc.resolucion, lc.fecha_resolucion,
                     lc.correlativo_inicial, lc.correlativo_final, lc.correlativo_siguiente,
-                    lc.cantidad_disponible, lc.cantidad_reservada, lc.created_at AS fecha_lote
+                    lc.cantidad_disponible, lc.cantidad_reservada, lc.created_at AS fecha_lote,
+                    lc.precio_unitario
                 FROM bodega_inventario.lotes_correlativo lc
                 INNER JOIN bodega_inventario.productos p ON p.id = lc.id_producto
                 INNER JOIN bodega_inventario.categorias_producto cp ON cp.id = p.id_categoria
@@ -408,7 +409,7 @@ class StockConsultaHelper
             $r['cantidad']       = (float)$r['cantidad_disponible'];
             $r['cantidad_reservada'] = (float)$r['cantidad_reservada'];
             $r['fecha_referencia'] = $r['fecha_resolucion'];
-            $r['precio_unitario']  = null;
+            $r['precio_unitario']  = $r['precio_unitario'] !== null ? (float)$r['precio_unitario'] : null;
         }
         unset($r);
 

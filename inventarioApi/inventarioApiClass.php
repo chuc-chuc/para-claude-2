@@ -5897,6 +5897,53 @@ final class inventarioApiClass extends ConexionBD
     }
 
     /**
+     * GET: bodega_inventario/obtenerProductosBodegaParaAjuste?id_bodega=
+     * Lista los productos que tienen algún registro de stock (aunque sea en
+     * 0) en la bodega indicada, para el selector de producto de la pantalla
+     * de Ajuste de Existencias. A diferencia de listarStockBodega, aquí la
+     * bodega es un parámetro libre elegido por el Administrador de Bodegas
+     * (no la bodega propia del encargado en sesión).
+     */
+    public function obtenerProductosBodegaParaAjuste(): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('Solo el Administrador de Bodegas puede consultar productos para ajuste');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT);
+            if (!$idBodega) {
+                return $this->res->fail('El campo id_bodega es requerido');
+            }
+
+            $stmt = $this->connect->prepare(
+                "SELECT DISTINCT p.id, p.nombre, p.id_tipo
+                 FROM   bodega_inventario.stock s
+                 INNER JOIN bodega_inventario.productos p ON p.id = s.id_producto
+                 WHERE  s.id_bodega = ? AND p.activo = 1
+                 ORDER BY p.nombre ASC"
+            );
+            $stmt->execute([$idBodega]);
+            $productos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($productos)) {
+                return $this->res->info('Esta bodega no tiene productos con stock registrado', null, ['productos' => []]);
+            }
+
+            foreach ($productos as &$p) {
+                $p['id']      = (int)$p['id'];
+                $p['id_tipo'] = (int)$p['id_tipo'];
+            }
+            unset($p);
+
+            return $this->res->ok('Productos obtenidos correctamente', ['productos' => $productos]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerProductosBodegaParaAjuste: " . $e->getMessage());
+            return $this->res->fail('Error al obtener los productos de la bodega', $e);
+        }
+    }
+
+    /**
      * GET: bodega_inventario/obtenerLotesParaAjuste?id_bodega=&id_producto=&id_unidad=&id_tipo=
      * Lista los lotes existentes de un producto (con su cantidad y precio
      * actuales) para que el Administrador de Bodegas elija cuál corregir.
@@ -13958,10 +14005,14 @@ FROM
                        ae.precio_anterior, ae.precio_nuevo,
                        ROUND((ae.cantidad_nueva * COALESCE(ae.precio_nuevo, 0))
                              - (ae.cantidad_anterior * COALESCE(ae.precio_anterior, 0)), 2) AS delta_valor,
-                       ae.motivo, ae.id_usuario, ae.created_at
+                       ae.motivo, ae.id_usuario,
+                       COALESCE(dp.nombres, ae.id_usuario) AS usuario,
+                       ae.created_at AS fecha
                 FROM bodega_inventario.ajustes_existencia ae
                 INNER JOIN bodega_inventario.bodegas b ON b.id = ae.id_bodega
                 INNER JOIN bodega_inventario.productos p ON p.id = ae.id_producto
+                LEFT JOIN dbintranet.usuarios u ON u.idUsuarios = ae.id_usuario
+                LEFT JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = u.idDatosPersonales
                 WHERE ae.created_at <= ?";
             $params = [$rango['hasta']];
 

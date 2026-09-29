@@ -5945,10 +5945,11 @@ final class inventarioApiClass extends ConexionBD
 
     /**
      * GET: bodega_inventario/obtenerLotesParaAjuste?id_bodega=&id_producto=&id_unidad=&id_tipo=
-     * Lista los lotes existentes de un producto (con su cantidad y precio
-     * actuales) para que el Administrador de Bodegas elija cuál corregir.
-     * Reutiliza StockConsultaHelper::detalleProducto — mismo contrato que
-     * ya usa el modal de Entrega Directa.
+     * Lista SOLO los lotes ajustables de un producto: los ingresados
+     * después del último cierre mensual (los anteriores están bloqueados
+     * de todas formas al momento de ajustar, así que ni se muestran), con
+     * la información necesaria para decidir el ajuste sin adivinar: fecha
+     * de creación, quién lo ingresó y de qué alta proviene.
      */
     public function obtenerLotesParaAjuste(): array
     {
@@ -5966,8 +5967,19 @@ final class inventarioApiClass extends ConexionBD
                 return $this->res->fail('Los campos id_bodega, id_producto e id_tipo son requeridos');
             }
 
-            $this->_inicializarStockConsultaHelper();
-            $detalle = $this->stockConsultaHelper->detalleProducto($idBodega, $idProducto, $idUnidad, $idTipo);
+            $tipoLote = match ($idTipo) {
+                1 => 'correlativo',
+                2 => 'expiracion',
+                default => 'normal',
+            };
+
+            $this->_inicializarAjusteExistenciaHelper();
+            $detalle = $this->ajusteExistenciaHelper->listarLotesAjustables($idBodega, $idProducto, $idUnidad, $tipoLote);
+            $detalle['tipo'] = $idTipo;
+
+            if (empty($detalle['lotes'])) {
+                return $this->res->info('No hay lotes ajustables (posteriores al último cierre) para esta selección', null, $detalle);
+            }
 
             return $this->res->ok('Lotes obtenidos correctamente', $detalle);
         } catch (Exception $e) {

@@ -95,6 +95,65 @@ class AjusteExistenciaHelper
         return $lote ?: null;
     }
 
+    /**
+     * Lista los lotes de un producto que SÍ se pueden ajustar: solo los
+     * ingresados después del último cierre mensual (los anteriores ya están
+     * bloqueados por ajustar() de todas formas, así que ni se muestran), y
+     * con la información que un Administrador de Bodegas necesita para
+     * decidir el ajuste sin adivinar: fecha de creación, quién lo ingresó
+     * (id_usuario_encargado, con su nombre) y de qué alta proviene.
+     *
+     * @param string $tipoLote  'normal' | 'expiracion' | 'correlativo'
+     */
+    public function listarLotesAjustables(
+        int $idBodega, int $idProducto, int $idUnidad, string $tipoLote
+    ): array {
+        $info = $this->_infoTabla($tipoLote);
+        $ultimoCierre = $this->cierreHelper->obtenerUltimoCierre();
+        $campoFecha = $info['campo_fecha'];
+
+        $joinUsuario = "LEFT JOIN dbintranet.usuarios du ON du.idUsuarios = t.id_usuario_encargado
+                         LEFT JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = du.idDatosPersonales";
+
+        if ($tipoLote === 'correlativo') {
+            $sql = "SELECT t.id, t.serie, t.resolucion, t.fecha_resolucion,
+                           t.correlativo_inicial, t.correlativo_final, t.correlativo_siguiente,
+                           t.cantidad_disponible, t.cantidad_reservada, t.precio_unitario,
+                           t.created_at AS fecha_creacion, t.id_alta,
+                           COALESCE(dp.nombres, t.id_usuario_encargado) AS creado_por
+                    FROM   bodega_inventario.lotes_correlativo t
+                    {$joinUsuario}
+                    WHERE  t.id_bodega = ? AND t.id_producto = ? AND t.cantidad_disponible > 0";
+            $params = [$idBodega, $idProducto];
+        } else {
+            $tabla = $info['tabla'];
+            $sql = "SELECT t.id, t.cantidad_disponible, t.cantidad_reservada, t.precio_unitario,
+                           t.{$campoFecha} AS fecha_referencia, t.{$campoFecha} AS fecha_creacion, t.id_alta,
+                           COALESCE(dp.nombres, t.id_usuario_encargado) AS creado_por"
+                 . ($tipoLote === 'expiracion' ? ", DATEDIFF(t.fecha_expiracion, CURDATE()) AS dias_restantes" : "")
+                 . " FROM   bodega_inventario.{$tabla} t
+                    {$joinUsuario}
+                    WHERE  t.id_bodega = ? AND t.id_producto = ? AND t.id_unidad = ? AND t.cantidad_disponible > 0";
+            $params = [$idBodega, $idProducto, $idUnidad];
+        }
+
+        if ($ultimoCierre !== null) {
+            $sql .= " AND t.{$campoFecha} > ?";
+            $params[] = $ultimoCierre;
+        }
+        $sql .= " ORDER BY t.{$campoFecha} ASC";
+
+        $stmt = $this->connect->prepare($sql);
+        $stmt->execute($params);
+        $lotes = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        return [
+            'tipo'          => $tipoLote,
+            'lotes'         => $lotes,
+            'ultimo_cierre' => $ultimoCierre,
+        ];
+    }
+
     // =========================================================================
     // AJUSTE PRINCIPAL
     // =========================================================================

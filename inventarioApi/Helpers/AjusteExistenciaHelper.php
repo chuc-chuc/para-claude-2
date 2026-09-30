@@ -38,10 +38,17 @@ use PDO;
  */
 class AjusteExistenciaHelper
 {
+    /**
+     * campo_creacion = cuándo entró el lote al sistema (NO cuándo vence).
+     * Es el campo correcto tanto para el bloqueo por cierre mensual como
+     * para "fecha_creacion" en el listado — fecha_expiracion es un dato
+     * de negocio aparte (cuándo vence la mercancía), no de cuándo se creó
+     * el registro.
+     */
     private const TABLAS_LOTE = [
-        'normal'      => ['tabla' => 'lotes_normal',      'campo_fecha' => 'fecha_ingreso'],
-        'expiracion'  => ['tabla' => 'lotes_expiracion',   'campo_fecha' => 'fecha_expiracion'],
-        'correlativo' => ['tabla' => 'lotes_correlativo',  'campo_fecha' => 'created_at'],
+        'normal'      => ['tabla' => 'lotes_normal',      'campo_creacion' => 'fecha_ingreso'],
+        'expiracion'  => ['tabla' => 'lotes_expiracion',   'campo_creacion' => 'created_at'],
+        'correlativo' => ['tabla' => 'lotes_correlativo',  'campo_creacion' => 'created_at'],
     ];
 
     private const NOMBRE_TIPO_POSITIVO = 'Ajuste positivo de inventario';
@@ -110,38 +117,48 @@ class AjusteExistenciaHelper
     ): array {
         $info = $this->_infoTabla($tipoLote);
         $ultimoCierre = $this->cierreHelper->obtenerUltimoCierre();
-        $campoFecha = $info['campo_fecha'];
+        $campoCreacion = $info['campo_creacion'];
 
         $joinUsuario = "LEFT JOIN dbintranet.usuarios du ON du.idUsuarios = t.id_usuario_encargado
                          LEFT JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = du.idDatosPersonales";
 
+        // Nota: lotes_normal NO tiene columna cantidad_reservada (a
+        // diferencia de expiracion/correlativo) — por eso va en un SELECT
+        // aparte y no en una condición común a los 3 tipos.
         if ($tipoLote === 'correlativo') {
             $sql = "SELECT t.id, t.serie, t.resolucion, t.fecha_resolucion,
                            t.correlativo_inicial, t.correlativo_final, t.correlativo_siguiente,
                            t.cantidad_disponible, t.cantidad_reservada, t.precio_unitario,
-                           t.created_at AS fecha_creacion, t.id_alta,
+                           t.{$campoCreacion} AS fecha_creacion, t.id_alta,
                            COALESCE(dp.nombres, t.id_usuario_encargado) AS creado_por
                     FROM   bodega_inventario.lotes_correlativo t
                     {$joinUsuario}
                     WHERE  t.id_bodega = ? AND t.id_producto = ? AND t.cantidad_disponible > 0";
             $params = [$idBodega, $idProducto];
-        } else {
-            $tabla = $info['tabla'];
+        } elseif ($tipoLote === 'expiracion') {
             $sql = "SELECT t.id, t.cantidad_disponible, t.cantidad_reservada, t.precio_unitario,
-                           t.{$campoFecha} AS fecha_referencia, t.{$campoFecha} AS fecha_creacion, t.id_alta,
-                           COALESCE(dp.nombres, t.id_usuario_encargado) AS creado_por"
-                 . ($tipoLote === 'expiracion' ? ", DATEDIFF(t.fecha_expiracion, CURDATE()) AS dias_restantes" : "")
-                 . " FROM   bodega_inventario.{$tabla} t
+                           t.fecha_expiracion, t.{$campoCreacion} AS fecha_creacion, t.id_alta,
+                           DATEDIFF(t.fecha_expiracion, CURDATE()) AS dias_restantes,
+                           COALESCE(dp.nombres, t.id_usuario_encargado) AS creado_por
+                    FROM   bodega_inventario.lotes_expiracion t
+                    {$joinUsuario}
+                    WHERE  t.id_bodega = ? AND t.id_producto = ? AND t.id_unidad = ? AND t.cantidad_disponible > 0";
+            $params = [$idBodega, $idProducto, $idUnidad];
+        } else {
+            $sql = "SELECT t.id, t.cantidad_disponible, t.precio_unitario,
+                           t.{$campoCreacion} AS fecha_ingreso, t.{$campoCreacion} AS fecha_creacion, t.id_alta,
+                           COALESCE(dp.nombres, t.id_usuario_encargado) AS creado_por
+                    FROM   bodega_inventario.lotes_normal t
                     {$joinUsuario}
                     WHERE  t.id_bodega = ? AND t.id_producto = ? AND t.id_unidad = ? AND t.cantidad_disponible > 0";
             $params = [$idBodega, $idProducto, $idUnidad];
         }
 
         if ($ultimoCierre !== null) {
-            $sql .= " AND t.{$campoFecha} > ?";
+            $sql .= " AND t.{$campoCreacion} > ?";
             $params[] = $ultimoCierre;
         }
-        $sql .= " ORDER BY t.{$campoFecha} ASC";
+        $sql .= " ORDER BY t.{$campoCreacion} ASC";
 
         $stmt = $this->connect->prepare($sql);
         $stmt->execute($params);
@@ -218,7 +235,9 @@ class AjusteExistenciaHelper
         }
 
         // 2. Bloqueo por cierre mensual — misma regla que las reversas
-        $fechaLote = $lote[$info['campo_fecha']] ?? $lote['created_at'] ?? null;
+        //    (se compara contra la fecha de CREACIÓN del lote, no contra
+        //    su fecha de expiración)
+        $fechaLote = $lote[$info['campo_creacion']] ?? $lote['created_at'] ?? null;
         if ($fechaLote !== null && !$this->cierreHelper->esPosteriorAlUltimoCierre((string)$fechaLote)) {
             $ultimoCierre = $this->cierreHelper->obtenerUltimoCierre();
             throw new Exception("Restricción contable: este lote pertenece a un periodo bloqueado por el último cierre mensual ({$ultimoCierre})");

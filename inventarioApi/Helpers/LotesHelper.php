@@ -61,7 +61,7 @@ class LotesHelper
         int $tipoMovimiento = 5
     ): float {
         $stmt = $this->connect->prepare(
-            "SELECT id, cantidad_disponible
+            "SELECT id, cantidad_disponible, precio_unitario
          FROM   bodega_inventario.lotes_normal
          WHERE  id_bodega         = ?
            AND  id_producto       = ?
@@ -101,7 +101,7 @@ class LotesHelper
         int $tipoMovimiento = 5
     ): float {
         $stmt = $this->connect->prepare(
-            "SELECT id, (cantidad_disponible - cantidad_reservada) AS cantidad_disponible
+            "SELECT id, (cantidad_disponible - cantidad_reservada) AS cantidad_disponible, precio_unitario
             FROM   bodega_inventario.lotes_expiracion
             WHERE  id_bodega   = ?
             AND  id_producto = ?
@@ -153,7 +153,7 @@ class LotesHelper
     ): array {
         $stmt = $this->connect->prepare(
             "SELECT id, correlativo_siguiente, correlativo_final,
-        (cantidad_disponible - cantidad_reservada) AS cantidad_disponible
+        (cantidad_disponible - cantidad_reservada) AS cantidad_disponible, precio_unitario
             FROM   bodega_inventario.lotes_correlativo
             WHERE  id_bodega   = ?
             AND  id_producto = ?

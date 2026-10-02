@@ -213,4 +213,34 @@ class StockHelper
          WHERE  id_bodega = ? AND id_producto = ? AND id_unidad = ?"
         )->execute([$cantidad, $idBodega, $idProducto, $idUnidad]);
     }
+
+    // =========================================================================
+    // AJUSTES DE EXISTENCIA (corrección manual de cantidad ya asentada)
+    // =========================================================================
+
+    /**
+     * Aplica un delta (positivo o negativo) a cantidad_total por un ajuste
+     * manual de inventario. GREATEST(0, ...) evita que quede negativo por
+     * inconsistencias previas. No toca cantidad_reservada.
+     *
+     * Usa INSERT … ON DUPLICATE KEY UPDATE porque un ajuste positivo podría
+     * darse sobre una combinación bodega/producto/unidad sin fila previa en
+     * `stock` (caso raro, pero posible si el lote se creó y luego se borró
+     * la fila resumen manualmente).
+     *
+     * @param int   $idBodega
+     * @param int   $idProducto
+     * @param int   $idUnidad
+     * @param float $delta       Positivo incrementa, negativo decrementa
+     */
+    public function ajustarCantidadTotal(
+        int $idBodega, int $idProducto, int $idUnidad, float $delta
+    ): void {
+        $this->connect->prepare(
+            "INSERT INTO bodega_inventario.stock
+                 (id_bodega, id_producto, id_unidad, cantidad_total, cantidad_reservada)
+             VALUES (?, ?, ?, GREATEST(0, ?), 0.00)
+             ON DUPLICATE KEY UPDATE cantidad_total = GREATEST(0, cantidad_total + ?)"
+        )->execute([$idBodega, $idProducto, $idUnidad, $delta, $delta]);
+    }
 }

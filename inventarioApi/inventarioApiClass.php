@@ -5897,147 +5897,6 @@ final class inventarioApiClass extends ConexionBD
     }
 
     /**
-     * GET: bodega_inventario/obtenerProductosBodegaParaAjuste?id_bodega=
-     * Lista los productos que tienen algún registro de stock (aunque sea en
-     * 0) en la bodega indicada, para el selector de producto de la pantalla
-     * de Ajuste de Existencias. A diferencia de listarStockBodega, aquí la
-     * bodega es un parámetro libre elegido por el Administrador de Bodegas
-     * (no la bodega propia del encargado en sesión).
-     */
-    public function obtenerProductosBodegaParaAjuste(): array
-    {
-        try {
-            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
-                return $this->res->fail('Solo el Administrador de Bodegas puede consultar productos para ajuste');
-            }
-
-            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT);
-            if (!$idBodega) {
-                return $this->res->fail('El campo id_bodega es requerido');
-            }
-
-            $stmt = $this->connect->prepare(
-                "SELECT DISTINCT p.id, p.nombre, p.id_tipo
-                 FROM   bodega_inventario.stock s
-                 INNER JOIN bodega_inventario.productos p ON p.id = s.id_producto
-                 WHERE  s.id_bodega = ? AND p.activo = 1
-                 ORDER BY p.nombre ASC"
-            );
-            $stmt->execute([$idBodega]);
-            $productos = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-            if (empty($productos)) {
-                return $this->res->info('Esta bodega no tiene productos con stock registrado', null, ['productos' => []]);
-            }
-
-            foreach ($productos as &$p) {
-                $p['id']      = (int)$p['id'];
-                $p['id_tipo'] = (int)$p['id_tipo'];
-            }
-            unset($p);
-
-            return $this->res->ok('Productos obtenidos correctamente', ['productos' => $productos]);
-        } catch (Exception $e) {
-            error_log("Error en obtenerProductosBodegaParaAjuste: " . $e->getMessage());
-            return $this->res->fail('Error al obtener los productos de la bodega', $e);
-        }
-    }
-
-    /**
-     * GET: bodega_inventario/obtenerLotesParaAjuste?id_bodega=&id_producto=&id_unidad=&id_tipo=
-     * Lista SOLO los lotes ajustables de un producto: los ingresados
-     * después del último cierre mensual (los anteriores están bloqueados
-     * de todas formas al momento de ajustar, así que ni se muestran), con
-     * la información necesaria para decidir el ajuste sin adivinar: fecha
-     * de creación, quién lo ingresó y de qué alta proviene.
-     */
-    public function obtenerLotesParaAjuste(): array
-    {
-        try {
-            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
-                return $this->res->fail('Solo el Administrador de Bodegas puede consultar lotes para ajuste');
-            }
-
-            $idBodega   = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT);
-            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT);
-            $idUnidad   = filter_input(INPUT_GET, 'id_unidad', FILTER_VALIDATE_INT) ?: 0;
-            $idTipo     = filter_input(INPUT_GET, 'id_tipo', FILTER_VALIDATE_INT);
-
-            if (!$idBodega || !$idProducto || !$idTipo) {
-                return $this->res->fail('Los campos id_bodega, id_producto e id_tipo son requeridos');
-            }
-
-            $tipoLote = match ($idTipo) {
-                1 => 'correlativo',
-                2 => 'expiracion',
-                default => 'normal',
-            };
-
-            $this->_inicializarAjusteExistenciaHelper();
-            $detalle = $this->ajusteExistenciaHelper->listarLotesAjustables($idBodega, $idProducto, $idUnidad, $tipoLote);
-            $detalle['tipo'] = $idTipo;
-
-            if (empty($detalle['lotes'])) {
-                return $this->res->info('No hay lotes ajustables (posteriores al último cierre) para esta selección', null, $detalle);
-            }
-
-            return $this->res->ok('Lotes obtenidos correctamente', $detalle);
-        } catch (Exception $e) {
-            error_log("Error en obtenerLotesParaAjuste: " . $e->getMessage());
-            return $this->res->fail('Error al obtener los lotes para ajuste', $e);
-        }
-    }
-
-    /**
-     * POST: bodega_inventario/ajustarExistenciaLote
-     * Corrige la cantidad y/o el precio de un lote ya ingresado (conteo
-     * físico, mercancía dañada no reportada, precio mal capturado, etc.).
-     * Solo el Administrador de Bodegas puede ejecutarlo, y no se permite
-     * sobre lotes de un período ya cerrado. Para lotes Correlativo solo se
-     * permite corregir el precio (la cantidad depende del rango de folios).
-     *
-     * @param object $datos {
-     *   tipo_lote: string        'normal' | 'expiracion' | 'correlativo'
-     *   id_lote: int
-     *   nueva_cantidad?: float   omitir/null = no tocar la cantidad
-     *   nuevo_precio?: float     omitir/null = no tocar el precio
-     *   motivo: string           obligatorio, mínimo 10 caracteres
-     * }
-     */
-    public function ajustarExistenciaLote($datos): array
-    {
-        try {
-            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
-                return $this->res->fail('Solo el Administrador de Bodegas puede realizar ajustes de existencia');
-            }
-
-            $datos = $this->limpiarDatos($datos);
-
-            $this->_inicializarAjusteExistenciaHelper();
-
-            $this->connect->beginTransaction();
-
-            $resultado = $this->ajusteExistenciaHelper->ajustar([
-                'tipo_lote'      => $datos->tipo_lote ?? '',
-                'id_lote'        => (int)($datos->id_lote ?? 0),
-                'nueva_cantidad' => property_exists($datos, 'nueva_cantidad') ? $datos->nueva_cantidad : null,
-                'nuevo_precio'   => property_exists($datos, 'nuevo_precio') ? $datos->nuevo_precio : null,
-                'motivo'         => $datos->motivo ?? '',
-            ]);
-
-            $this->connect->commit();
-
-            return $this->res->ok('Ajuste de existencia aplicado correctamente', $resultado);
-        } catch (Exception $e) {
-            if ($this->connect->inTransaction()) {
-                $this->connect->rollBack();
-            }
-            error_log("Error en ajustarExistenciaLote: " . $e->getMessage());
-            return $this->res->fail($e->getMessage(), $e);
-        }
-    }
-
-    /**
      * Elimina el último lote ingresado de un alta bajo la regla estricta LIFO y revierte el stock asignado.
      * Valida de forma rigurosa que el lote no tenga consumos y sea posterior al último cierre mensual.
      *
@@ -13989,75 +13848,6 @@ FROM
     }
 
     /**
-     * GET: bodega_inventario/obtenerReporteAjustesPeriodo?id_cierre=|desde=&hasta=&id_bodega=
-     * Detalle de cada corrección manual de cantidad y/o precio aplicada vía
-     * el módulo de Ajuste de Existencias, en el período. Se reporta aparte
-     * de altas/consumos porque son correcciones excepcionales, no
-     * movimiento normal de mercancía — contabilidad necesita poder
-     * identificarlas de un vistazo.
-     */
-    public function obtenerReporteAjustesPeriodo(): array
-    {
-        try {
-            if (!$this->_esCierresAdmin()) {
-                return $this->res->fail('No tiene permisos para consultar reportes de cierre. Se requiere rol de Contabilidad.');
-            }
-
-            $rango = $this->_resolverRangoReporte();
-            if ($rango === null) {
-                return $this->res->fail('Indique id_cierre, o un rango desde/hasta (formato AAAA-MM-DD)');
-            }
-
-            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
-
-            $sql = "SELECT ae.id, ae.id_bodega, b.nombre AS bodega, ae.id_producto, p.nombre AS producto,
-                       ae.tipo_lote, ae.id_lote,
-                       ae.cantidad_anterior, ae.cantidad_nueva,
-                       ROUND(ae.cantidad_nueva - ae.cantidad_anterior, 2) AS delta_cantidad,
-                       ae.precio_anterior, ae.precio_nuevo,
-                       ROUND((ae.cantidad_nueva * COALESCE(ae.precio_nuevo, 0))
-                             - (ae.cantidad_anterior * COALESCE(ae.precio_anterior, 0)), 2) AS delta_valor,
-                       ae.motivo, ae.id_usuario,
-                       COALESCE(dp.nombres, ae.id_usuario) AS usuario,
-                       ae.created_at AS fecha
-                FROM bodega_inventario.ajustes_existencia ae
-                INNER JOIN bodega_inventario.bodegas b ON b.id = ae.id_bodega
-                INNER JOIN bodega_inventario.productos p ON p.id = ae.id_producto
-                LEFT JOIN dbintranet.usuarios u ON u.idUsuarios = ae.id_usuario
-                LEFT JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = u.idDatosPersonales
-                WHERE ae.created_at <= ?";
-            $params = [$rango['hasta']];
-
-            if ($rango['desde']) {
-                $sql .= $rango['exclusivoDesde'] ? " AND ae.created_at > ?" : " AND ae.created_at >= ?";
-                $params[] = $rango['desde'];
-            }
-            if ($idBodega) {
-                $sql .= " AND ae.id_bodega = ?";
-                $params[] = $idBodega;
-            }
-            $sql .= " ORDER BY ae.created_at ASC";
-
-            $stmt = $this->connect->prepare($sql);
-            $stmt->execute($params);
-            $ajustes = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-            if (empty($ajustes)) {
-                return $this->res->info('No hay ajustes registrados con los filtros indicados', null, ['ajustes' => [], 'total_movimientos' => 0, 'delta_valor_total' => 0]);
-            }
-
-            return $this->res->ok('Reporte de ajustes del período obtenido', [
-                'ajustes' => $ajustes,
-                'total_movimientos' => count($ajustes),
-                'delta_valor_total' => round(array_sum(array_column($ajustes, 'delta_valor')), 2),
-            ]);
-        } catch (Exception $e) {
-            error_log("Error en obtenerReporteAjustesPeriodo: " . $e->getMessage());
-            return $this->res->fail('Error al obtener el reporte de ajustes del período', $e);
-        }
-    }
-
-    /**
      * GET: bodega_inventario/listarCierresDisponibles
      * Lista todos los cierres mensuales ya ejecutados, para que el front
      * arme un select en vez de pedirle al usuario que adivine el id_cierre.
@@ -15696,6 +15486,238 @@ FROM
         } catch (Exception $e) {
             error_log("Error en obtenerReporteMisGastosUniformes: " . $e->getMessage());
             return $this->res->fail('Error al obtener el reporte de gastos en uniformes', $e);
+        }
+    }
+
+    // =========================================================================
+    // =========================================================================
+    //  SECCIÓN: AJUSTE DE EXISTENCIAS
+    //  Corrección manual de cantidad y/o precio de un lote ya existente en
+    //  bodega (normal, expiración o correlativo). Solo el Administrador de
+    //  Bodegas puede ejecutar ajustes; el reporte del período es solo para
+    //  Contabilidad. Lógica real en Helpers/AjusteExistenciaHelper.php —
+    //  estos 4 métodos son únicamente la capa de endpoint (permisos,
+    //  parseo de parámetros, transacción, respuesta).
+    //
+    //  Deliberadamente agrupados aquí, todos juntos, en vez de donde cada
+    //  uno "encajaría" por tema (altas/lotes, reportes de cierre, etc.) —
+    //  para que cualquier cambio futuro al módulo de ajustes se ubique en
+    //  un solo lugar sin tener que buscar en todo el archivo.
+    //
+    //  - obtenerProductosBodegaParaAjuste  GET
+    //  - obtenerLotesParaAjuste            GET
+    //  - ajustarExistenciaLote             POST
+    //  - obtenerReporteAjustesPeriodo      GET
+    // =========================================================================
+    // =========================================================================
+
+    /**
+     * GET: bodega_inventario/obtenerProductosBodegaParaAjuste?id_bodega=
+     * Lista los productos que tienen algún registro de stock (aunque sea en
+     * 0) en la bodega indicada, para el selector de producto de la pantalla
+     * de Ajuste de Existencias. A diferencia de listarStockBodega, aquí la
+     * bodega es un parámetro libre elegido por el Administrador de Bodegas
+     * (no la bodega propia del encargado en sesión).
+     */
+    public function obtenerProductosBodegaParaAjuste(): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('Solo el Administrador de Bodegas puede consultar productos para ajuste');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT);
+            if (!$idBodega) {
+                return $this->res->fail('El campo id_bodega es requerido');
+            }
+
+            $stmt = $this->connect->prepare(
+                "SELECT DISTINCT p.id, p.nombre, p.id_tipo
+                 FROM   bodega_inventario.stock s
+                 INNER JOIN bodega_inventario.productos p ON p.id = s.id_producto
+                 WHERE  s.id_bodega = ? AND p.activo = 1
+                 ORDER BY p.nombre ASC"
+            );
+            $stmt->execute([$idBodega]);
+            $productos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($productos)) {
+                return $this->res->info('Esta bodega no tiene productos con stock registrado', null, ['productos' => []]);
+            }
+
+            foreach ($productos as &$p) {
+                $p['id']      = (int)$p['id'];
+                $p['id_tipo'] = (int)$p['id_tipo'];
+            }
+            unset($p);
+
+            return $this->res->ok('Productos obtenidos correctamente', ['productos' => $productos]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerProductosBodegaParaAjuste: " . $e->getMessage());
+            return $this->res->fail('Error al obtener los productos de la bodega', $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerLotesParaAjuste?id_bodega=&id_producto=&id_unidad=&id_tipo=
+     * Lista SOLO los lotes ajustables de un producto: los ingresados
+     * después del último cierre mensual (los anteriores están bloqueados
+     * de todas formas al momento de ajustar, así que ni se muestran), con
+     * la información necesaria para decidir el ajuste sin adivinar: fecha
+     * de creación, quién lo ingresó y de qué alta proviene.
+     */
+    public function obtenerLotesParaAjuste(): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('Solo el Administrador de Bodegas puede consultar lotes para ajuste');
+            }
+
+            $idBodega   = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT);
+            $idProducto = filter_input(INPUT_GET, 'id_producto', FILTER_VALIDATE_INT);
+            $idUnidad   = filter_input(INPUT_GET, 'id_unidad', FILTER_VALIDATE_INT) ?: 0;
+            $idTipo     = filter_input(INPUT_GET, 'id_tipo', FILTER_VALIDATE_INT);
+
+            if (!$idBodega || !$idProducto || !$idTipo) {
+                return $this->res->fail('Los campos id_bodega, id_producto e id_tipo son requeridos');
+            }
+
+            $tipoLote = match ($idTipo) {
+                1 => 'correlativo',
+                2 => 'expiracion',
+                default => 'normal',
+            };
+
+            $this->_inicializarAjusteExistenciaHelper();
+            $detalle = $this->ajusteExistenciaHelper->listarLotesAjustables($idBodega, $idProducto, $idUnidad, $tipoLote);
+            $detalle['tipo'] = $idTipo;
+
+            if (empty($detalle['lotes'])) {
+                return $this->res->info('No hay lotes ajustables (posteriores al último cierre) para esta selección', null, $detalle);
+            }
+
+            return $this->res->ok('Lotes obtenidos correctamente', $detalle);
+        } catch (Exception $e) {
+            error_log("Error en obtenerLotesParaAjuste: " . $e->getMessage());
+            return $this->res->fail('Error al obtener los lotes para ajuste', $e);
+        }
+    }
+
+    /**
+     * POST: bodega_inventario/ajustarExistenciaLote
+     * Corrige la cantidad y/o el precio de un lote ya ingresado (conteo
+     * físico, mercancía dañada no reportada, precio mal capturado, etc.).
+     * Solo el Administrador de Bodegas puede ejecutarlo, y no se permite
+     * sobre lotes de un período ya cerrado. Para lotes Correlativo solo se
+     * permite corregir el precio (la cantidad depende del rango de folios).
+     *
+     * @param object $datos {
+     *   tipo_lote: string        'normal' | 'expiracion' | 'correlativo'
+     *   id_lote: int
+     *   nueva_cantidad?: float   omitir/null = no tocar la cantidad
+     *   nuevo_precio?: float     omitir/null = no tocar el precio
+     *   motivo: string           obligatorio, mínimo 10 caracteres
+     * }
+     */
+    public function ajustarExistenciaLote($datos): array
+    {
+        try {
+            if (!RolCompraHelper::esAdministradorBodegas($this->puesto)) {
+                return $this->res->fail('Solo el Administrador de Bodegas puede realizar ajustes de existencia');
+            }
+
+            $datos = $this->limpiarDatos($datos);
+
+            $this->_inicializarAjusteExistenciaHelper();
+
+            $this->connect->beginTransaction();
+
+            $resultado = $this->ajusteExistenciaHelper->ajustar([
+                'tipo_lote'      => $datos->tipo_lote ?? '',
+                'id_lote'        => (int)($datos->id_lote ?? 0),
+                'nueva_cantidad' => property_exists($datos, 'nueva_cantidad') ? $datos->nueva_cantidad : null,
+                'nuevo_precio'   => property_exists($datos, 'nuevo_precio') ? $datos->nuevo_precio : null,
+                'motivo'         => $datos->motivo ?? '',
+            ]);
+
+            $this->connect->commit();
+
+            return $this->res->ok('Ajuste de existencia aplicado correctamente', $resultado);
+        } catch (Exception $e) {
+            if ($this->connect->inTransaction()) {
+                $this->connect->rollBack();
+            }
+            error_log("Error en ajustarExistenciaLote: " . $e->getMessage());
+            return $this->res->fail($e->getMessage(), $e);
+        }
+    }
+
+    /**
+     * GET: bodega_inventario/obtenerReporteAjustesPeriodo?id_cierre=|desde=&hasta=&id_bodega=
+     * Detalle de cada corrección manual de cantidad y/o precio aplicada vía
+     * el módulo de Ajuste de Existencias, en el período. Se reporta aparte
+     * de altas/consumos porque son correcciones excepcionales, no
+     * movimiento normal de mercancía — contabilidad necesita poder
+     * identificarlas de un vistazo.
+     */
+    public function obtenerReporteAjustesPeriodo(): array
+    {
+        try {
+            if (!$this->_esCierresAdmin()) {
+                return $this->res->fail('No tiene permisos para consultar reportes de cierre. Se requiere rol de Contabilidad.');
+            }
+
+            $rango = $this->_resolverRangoReporte();
+            if ($rango === null) {
+                return $this->res->fail('Indique id_cierre, o un rango desde/hasta (formato AAAA-MM-DD)');
+            }
+
+            $idBodega = filter_input(INPUT_GET, 'id_bodega', FILTER_VALIDATE_INT) ?: null;
+
+            $sql = "SELECT ae.id, ae.id_bodega, b.nombre AS bodega, ae.id_producto, p.nombre AS producto,
+                       ae.tipo_lote, ae.id_lote,
+                       ae.cantidad_anterior, ae.cantidad_nueva,
+                       ROUND(ae.cantidad_nueva - ae.cantidad_anterior, 2) AS delta_cantidad,
+                       ae.precio_anterior, ae.precio_nuevo,
+                       ROUND((ae.cantidad_nueva * COALESCE(ae.precio_nuevo, 0))
+                             - (ae.cantidad_anterior * COALESCE(ae.precio_anterior, 0)), 2) AS delta_valor,
+                       ae.motivo, ae.id_usuario,
+                       COALESCE(dp.nombres, ae.id_usuario) AS usuario,
+                       ae.created_at AS fecha
+                FROM bodega_inventario.ajustes_existencia ae
+                INNER JOIN bodega_inventario.bodegas b ON b.id = ae.id_bodega
+                INNER JOIN bodega_inventario.productos p ON p.id = ae.id_producto
+                LEFT JOIN dbintranet.usuarios u ON u.idUsuarios = ae.id_usuario
+                LEFT JOIN dbintranet.datospersonales dp ON dp.idDatosPersonales = u.idDatosPersonales
+                WHERE ae.created_at <= ?";
+            $params = [$rango['hasta']];
+
+            if ($rango['desde']) {
+                $sql .= $rango['exclusivoDesde'] ? " AND ae.created_at > ?" : " AND ae.created_at >= ?";
+                $params[] = $rango['desde'];
+            }
+            if ($idBodega) {
+                $sql .= " AND ae.id_bodega = ?";
+                $params[] = $idBodega;
+            }
+            $sql .= " ORDER BY ae.created_at ASC";
+
+            $stmt = $this->connect->prepare($sql);
+            $stmt->execute($params);
+            $ajustes = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($ajustes)) {
+                return $this->res->info('No hay ajustes registrados con los filtros indicados', null, ['ajustes' => [], 'total_movimientos' => 0, 'delta_valor_total' => 0]);
+            }
+
+            return $this->res->ok('Reporte de ajustes del período obtenido', [
+                'ajustes' => $ajustes,
+                'total_movimientos' => count($ajustes),
+                'delta_valor_total' => round(array_sum(array_column($ajustes, 'delta_valor')), 2),
+            ]);
+        } catch (Exception $e) {
+            error_log("Error en obtenerReporteAjustesPeriodo: " . $e->getMessage());
+            return $this->res->fail('Error al obtener el reporte de ajustes del período', $e);
         }
     }
 }
